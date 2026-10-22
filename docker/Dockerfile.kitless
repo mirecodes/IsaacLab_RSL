@@ -70,7 +70,7 @@ COPY source/ source/
 # is not a lock entry. ``uv sync`` reuses the venv only because UV_PYTHON pins the same interpreter
 # it was created with; otherwise it deletes and rebuilds it.
 RUN uv venv --seed "${VIRTUAL_ENV}" \
- && uv sync --frozen --inexact --extra all --extra importers --extra test \
+ && uv sync --frozen --inexact --extra all --extra importers --extra test --extra video --extra wandb \
  && chmod -R a+rwX "${VIRTUAL_ENV}"/lib/python3.*/site-packages/ovrtx \
  && python -c "import importlib.metadata as m; \
       names = {d.metadata['Name'].lower() for d in m.distributions()}; \

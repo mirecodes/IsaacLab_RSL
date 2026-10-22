@@ -1,0 +1,7 @@
+    services:
+      isaac-lab-kitless:
+        volumes:
+          - type: bind
+            source: ${HOME}/hyeslee/codes
+            target: /workspace/codes
+        user: "0:0"
