@@ -3,32 +3,28 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Robust A2 policy: the Go2 robust teacher of :mod:`..go2_study.robust_env_cfg`, rescaled to Unitree A2.
+"""Robust A2 policy: the Go2 teacher of :mod:`..go2_study.robust_env_cfg` (Miki et al. 2022), adapted to A2.
 
-The method is unchanged: CPG action space, observations, Miki et al. 2022 reward terms, terrain families,
-and curricula. Only robot-dependent quantities change. A2 is treated as Go2 scaled by
-:data:`~isaaclab_assets.robots.unitree.A2_LENGTH_SCALE` ``L`` (~1.29, 0.275 m vs. 0.213 m leg segments) in
-length and :data:`~isaaclab_assets.robots.unitree.A2_MASS_SCALE` ``M`` (~2.67, 40.1 kg vs. 15 kg) in mass,
-and every Go2 value is mapped by Froude (dynamic) similarity:
+The method is unchanged: CPG action space, observations, reward terms, terrain families, and curricula.
+The robot's own values (gains, limits, armature, default pose) are Unitree's, see
+:obj:`~isaaclab_assets.robots.unitree.UNITREE_A2_CFG`. The task is scaled from the paper's ANYmal to A2 by
+the same rules the Go2 teacher uses with :data:`~..go2_study.robust_env_cfg.GO2_SCALE`, with
+:data:`A2_SCALE` in its place:
 
-* Lengths and heights x L: terrain obstacles, CPG swing height, foot-clearance threshold, foot-scan radii,
-  CoM offsets, base-height target.
-* Linear velocities x sqrt(L): commands, pushes, reset velocities, tracking std. Angular velocities and the
-  CPG base frequency x 1/sqrt(L).
-* Forces x M and torques x M L: external wrench, and the torque used to normalize the torque penalty.
-* Penalties on squared dimensional quantities are divided by the square of that quantity's scale, so each
-  term weighs as much as on Go2: joint velocity x L, joint acceleration x L^2, foot slip / L, base height / L^2,
-  torque / (M L)^2. Terms on joint angles or counts (knee, target smoothness, clearance, collisions) and the
-  body-motion term, which mixes v_z^2 and |w|, keep Go2's weights.
-* Force observations / M, so they keep Go2's magnitude: the PPO config does not normalize observations.
+* Lengths, heights, and the swing height x :data:`A2_SCALE`; the base frequency by Froude similarity; the
+  tracking std by sqrt(:data:`A2_SCALE`); the torque weight by the squared ratio of peak joint torques.
+* Values the Go2 teacher chose for Go2 rather than taking from the paper (hill and rough-terrain noise,
+  box widths and minimum height) are scaled by ``A2_SCALE / GO2_SCALE``, i.e. treated as Go2-sized.
+* The external force is about 0.2 x the robot's weight, as for Go2.
+* Commands, pushes, and the remaining randomization keep the shared velocity-task defaults, as for Go2.
 
-Deviations from a pure rescaling, forced by the A2 asset:
+Deviations from the Go2 teacher, forced by the A2 asset or robot:
 
 * The importer nests the links (``Robot/Geometry/base_link/FL_hip/...``) and names the base ``base_link``,
   so prim paths and body names differ from ``go2.usd``.
-* The obstacle heights reach 0.34 m (grid and large steps) and 0.19 m (stairs) at the top difficulty
-  level, above A2's rated 0.30 m step height for the large steps. They are kept as the curriculum ceiling,
-  as for Go2 and the paper.
+* The base-height target is the base height of Unitree's default pose instead of Go2's spawn height.
+* The large and grid steps reach 0.35 m at the top difficulty level, above A2's rated 0.30 m step height.
+  They are kept as the curriculum ceiling, as the paper's 0.4 m is for ANYmal.
 """
 
 import math
@@ -36,10 +32,9 @@ import math
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass, replace
 
-from isaaclab_assets.robots.unitree import A2_LENGTH_SCALE, A2_MASS_SCALE, UNITREE_A2_CFG
+from isaaclab_assets.robots.unitree import UNITREE_A2_CFG
 
 from ..go2_study.robust_env_cfg import (
-    BASE_FREQUENCY,
     FEET,
     GO2_SCALE,
     STEP_DT,
@@ -49,8 +44,24 @@ from ..go2_study.robust_env_cfg import (
     teacher_terrain_generator,
 )
 
-L = A2_LENGTH_SCALE
-M = A2_MASS_SCALE
+A2_SCALE = (0.275 + 0.275) / (0.285 + 0.349)
+"""A2 / ANYmal length scale, from the leg lengths (hip-flexion joint to foot) of A2 and ANYmal C.
+
+The same ratio for Go2 (0.426 m) is 0.672, which matches :data:`GO2_SCALE` (0.667, from base heights).
+"""
+
+GO2_TO_A2 = A2_SCALE / GO2_SCALE
+"""Length scale from the Go2 teacher's values to A2."""
+
+A2_MASS = 40.07
+"""Total link mass [kg] of the A2 URDF."""
+
+A2_STANDING_HEIGHT = 0.385
+"""Base height [m] of Unitree's default pose (hip -/+0.1, thigh 0.9, calf -1.8 rad) from the URDF kinematics,
+including the 0.032 m foot radius."""
+
+A2_BASE_FREQUENCY = 1.25 / math.sqrt(A2_SCALE)
+"""CPG base frequency [Hz]: 1.25 Hz (Lee et al. 2020, ANYmal) scaled by Froude similarity."""
 
 BASE = "base_link"
 """Base body name in the imported A2 asset (``base`` on Go2)."""
@@ -58,23 +69,20 @@ BASE = "base_link"
 FOOT_PATHS = {foot: f"Geometry/{BASE}/{foot[:2]}_hip/{foot[:2]}_thigh/{foot[:2]}_calf/{foot}" for foot in FEET}
 """Foot prim paths below the robot prim."""
 
-A2_BASE_FREQUENCY = BASE_FREQUENCY / math.sqrt(L)
-"""CPG base frequency [Hz]: Go2's, scaled by Froude similarity."""
-
 
 @configclass
 class A2TeacherSceneCfg(TeacherSceneCfg):
     """Go2 teacher scene with the foot scanners on A2's nested feet and radii scaled to A2."""
 
-    foot_scanner_FL = foot_scanner(FOOT_PATHS["FL_foot"], length_scale=L)
-    foot_scanner_FR = foot_scanner(FOOT_PATHS["FR_foot"], length_scale=L)
-    foot_scanner_RL = foot_scanner(FOOT_PATHS["RL_foot"], length_scale=L)
-    foot_scanner_RR = foot_scanner(FOOT_PATHS["RR_foot"], length_scale=L)
+    foot_scanner_FL = foot_scanner(FOOT_PATHS["FL_foot"], length_scale=GO2_TO_A2)
+    foot_scanner_FR = foot_scanner(FOOT_PATHS["FR_foot"], length_scale=GO2_TO_A2)
+    foot_scanner_RL = foot_scanner(FOOT_PATHS["RL_foot"], length_scale=GO2_TO_A2)
+    foot_scanner_RR = foot_scanner(FOOT_PATHS["RR_foot"], length_scale=GO2_TO_A2)
 
 
 @configclass
 class A2RobustTeacherEnvCfg(Go2RobustTeacherEnvCfg):
-    """A2 teacher policy after Miki et al. 2022, rescaled from the Go2 teacher."""
+    """A2 teacher policy after Miki et al. 2022."""
 
     scene: A2TeacherSceneCfg = A2TeacherSceneCfg(num_envs=4096, env_spacing=2.5)
 
@@ -86,71 +94,37 @@ class A2RobustTeacherEnvCfg(Go2RobustTeacherEnvCfg):
         self.scene.height_scanner.prim_path = f"{{ENV_REGEX_NS}}/Robot/Geometry/{BASE}"
         # body-level sensing only matches rigid bodies, so this skips the collision and visual prims
         self.scene.contact_forces.prim_path = "{ENV_REGEX_NS}/Robot/Geometry/.*"
-        for name in ("foot_scanner_FL", "foot_scanner_FR", "foot_scanner_RL", "foot_scanner_RR"):
-            getattr(self.scene, name).offset.pos = (0.0, 0.0, 0.5 * L)
         for event in ("add_base_mass", "base_com", "base_external_force_torque"):
             getattr(self.events, event).params["asset_cfg"] = SceneEntityCfg("robot", body_names=BASE)
         self.observations.policy.external_wrench.params["asset_cfg"] = SceneEntityCfg("robot", body_names=BASE)
         self.terminations.base_contact.params["sensor_cfg"].body_names = BASE
 
-        # -- commands: Froude-scaled velocity ranges
-        ranges = self.commands.base_velocity.ranges
-        ranges.lin_vel_x = (-math.sqrt(L), math.sqrt(L))
-        ranges.lin_vel_y = (-math.sqrt(L), math.sqrt(L))
-        ranges.ang_vel_z = (-1.0 / math.sqrt(L), 1.0 / math.sqrt(L))
-
-        # -- actions: A2 leg geometry, swing height and base frequency scaled from Go2
+        # -- actions: A2 leg geometry, swing height and base frequency scaled from ANYmal
         cpg = self.actions.joint_pos
         cpg.thigh_length = 0.275
         cpg.calf_length = 0.275
         cpg.base_frequency = A2_BASE_FREQUENCY
-        cpg.swing_height = 0.2 * GO2_SCALE * L
+        cpg.swing_height = 0.2 * A2_SCALE
         cpg.phase_offset_scale = 0.5 * 2.0 * math.pi * A2_BASE_FREQUENCY * STEP_DT
 
-        # -- observations: forces in Go2 units, heights clipped at the scaled range
-        policy = self.observations.policy
-        policy.foot_height_scan.clip = (-L, L)
-        policy.foot_contact_forces.scale = 0.01 / M
-        policy.external_wrench.scale = 0.05 / M
+        # -- terrain: the paper's families, heights scaled to A2
+        self.scene.terrain.terrain_generator = teacher_terrain_generator(length_scale=GO2_TO_A2)
 
-        # -- terrain: Go2's families with obstacle heights and widths scaled by L
-        self.scene.terrain.terrain_generator = teacher_terrain_generator(length_scale=L)
+        # -- domain randomization: external wrench about 0.2 x A2's weight; the torque keeps Go2's
+        # 0.1 m lever arm, scaled to A2
+        force = 0.2 * A2_MASS * 9.81
+        torque = 0.1 * GO2_TO_A2 * force
+        self.events.base_external_force_torque.params["force_range"] = (-force, force)
+        self.events.base_external_force_torque.params["torque_range"] = (-torque, torque)
 
-        # -- domain randomization
-        self.events.base_com.params["com_range"] = {
-            "x": (-0.05 * L, 0.05 * L),
-            "y": (-0.05 * L, 0.05 * L),
-            "z": (-0.01 * L, 0.01 * L),
-        }
-        self.events.push_robot.params["velocity_range"] = {
-            "x": (-0.5 * math.sqrt(L), 0.5 * math.sqrt(L)),
-            "y": (-0.5 * math.sqrt(L), 0.5 * math.sqrt(L)),
-        }
-        v, w = 0.5 * math.sqrt(L), 0.5 / math.sqrt(L)
-        self.events.reset_base.params["velocity_range"] = {
-            "x": (-v, v),
-            "y": (-v, v),
-            "z": (-v, v),
-            "roll": (-w, w),
-            "pitch": (-w, w),
-            "yaw": (-w, w),
-        }
-        self.events.reset_robot_joints.params["velocity_range"] = (-1.0 / math.sqrt(L), 1.0 / math.sqrt(L))
-        # Go2's 30 N (about 0.2 x its weight) and 3 N*m, scaled by the weight and the lever arm
-        self.events.base_external_force_torque.params["force_range"] = (-30.0 * M, 30.0 * M)
-        self.events.base_external_force_torque.params["torque_range"] = (-3.0 * M * L, 3.0 * M * L)
-
-        # -- rewards: Go2's weights, rescaled where the penalized quantity has a dimension (module docstring)
+        # -- rewards: Go2's weights with A2's scale
+        velocity_std = math.sqrt(A2_SCALE)
         rewards = self.rewards
-        lin_std, ang_std = math.sqrt(GO2_SCALE * L), math.sqrt(GO2_SCALE / L)
-        rewards.track_lin_vel.params["std"] = lin_std
-        rewards.track_ang_vel.params["std"] = ang_std
-        rewards.lin_vel_orthogonal.params["std"] = lin_std
-        rewards.foot_clearance.params["threshold"] = 0.2 * GO2_SCALE * L
-        rewards.joint_vel_l2.weight *= L
-        rewards.dof_acc_l2.weight *= L**2
-        rewards.foot_slip.weight /= L
-        # Go2's ~30 N*m reference torque, scaled by the weight and the lever arm
-        rewards.dof_torques_l2.weight = -2 * 1.0e-6 * (80.0 / (30.0 * M * L)) ** 2
-        rewards.base_height_l2.params["target_height"] = 0.4 * L
-        rewards.base_height_l2.weight /= L**2
+        rewards.track_lin_vel.params["std"] = velocity_std
+        rewards.track_ang_vel.params["std"] = velocity_std
+        rewards.lin_vel_orthogonal.params["std"] = velocity_std
+        rewards.foot_clearance.params["threshold"] = 0.2 * A2_SCALE
+        # ANYmal's 80 N*m peak torque vs. A2's ~140 N*m (120 N*m hip and thigh, 180 N*m calf; Go2's ~30 N*m
+        # is the same joint average of 23.7 and 45.4 N*m)
+        rewards.dof_torques_l2.weight = -2 * 1.0e-6 * (80.0 / 140.0) ** 2
+        rewards.base_height_l2.params["target_height"] = A2_STANDING_HEIGHT

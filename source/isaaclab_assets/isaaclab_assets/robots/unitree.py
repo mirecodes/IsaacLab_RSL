@@ -203,12 +203,6 @@ UNITREE_GO2_CFG = ArticulationCfg(
 """Configuration of Unitree Go2 using DC-Motor actuator model."""
 
 
-A2_LENGTH_SCALE = 0.275 / 0.213
-"""A2 / Go2 length scale, from the thigh and calf lengths (both legs segments are equal on each robot)."""
-
-A2_MASS_SCALE = 40.07 / 15.0
-"""A2 / Go2 mass scale, from the total link masses of the A2 URDF and Go2."""
-
 UNITREE_A2_CFG = ArticulationCfg(
     # Pre-converted from ``urdf/a2.urdf`` (see ``usd/config.yaml`` for the converter settings): converting
     # at spawn time fails under Newton, which does not register the PhysX schemas the URDF importer applies.
@@ -233,16 +227,14 @@ UNITREE_A2_CFG = ArticulationCfg(
             NewtonArticulationCfg(self_collision_enabled=False),
         ],
     ),
-    # Go2's joint angles: both robots have equal thigh and calf lengths, so the stance is geometrically
-    # similar, and Go2's spawn height scaled by A2_LENGTH_SCALE.
+    # Unitree's default pose and spawn height; the hips point the feet slightly inward
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.4 * A2_LENGTH_SCALE),
+        pos=(0.0, 0.0, 0.4),
         joint_pos={
-            ".*L_hip_joint": 0.1,
-            ".*R_hip_joint": -0.1,
-            "F[L,R]_thigh_joint": 0.8,
-            "R[L,R]_thigh_joint": 1.0,
-            ".*_calf_joint": -1.5,
+            ".*L_hip_joint": -0.1,
+            ".*R_hip_joint": 0.1,
+            ".*_thigh_joint": 0.9,
+            ".*_calf_joint": -1.8,
         },
         joint_vel={".*": 0.0},
     ),
@@ -250,15 +242,13 @@ UNITREE_A2_CFG = ArticulationCfg(
     actuators={
         "base_legs": DCMotorCfg(
             joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-            # limits from ``a2.urdf``; the calf has a higher joint-side torque and lower speed, as on Go2
+            # torque limits from Unitree, speed limits from ``a2.urdf``
             actuator_effort_limit={".*_hip_joint": 120.0, ".*_thigh_joint": 120.0, ".*_calf_joint": 180.0},
             saturation_effort={".*_hip_joint": 120.0, ".*_thigh_joint": 120.0, ".*_calf_joint": 180.0},
             actuator_velocity_limit={".*_hip_joint": 22.0, ".*_thigh_joint": 22.0, ".*_calf_joint": 14.67},
-            # Go2's 25 / 0.5 under dynamic similarity: stiffness ~ m * g * l, damping ~ stiffness * sqrt(l / g)
-            stiffness=25.0 * A2_MASS_SCALE * A2_LENGTH_SCALE,
-            damping=0.5 * A2_MASS_SCALE * A2_LENGTH_SCALE**1.5,
+            stiffness={".*_hip_joint": 100.0, ".*_thigh_joint": 100.0, ".*_calf_joint": 150.0},
+            damping={".*_hip_joint": 4.0, ".*_thigh_joint": 4.0, ".*_calf_joint": 6.0},
             friction=0.0,
-            # rotor inertia from Unitree's ``a2.xml`` (unitree_mujoco)
             armature=0.03,
         ),
     },
@@ -267,6 +257,10 @@ UNITREE_A2_CFG = ArticulationCfg(
 
 Asset source: ``robots/a2_description`` of https://github.com/unitreerobotics/unitree_ros (BSD-3-Clause),
 stored under ``data/Robots/Unitree/A2`` (see its ``README.md``) because A2 is not on Nucleus.
+
+Gains, torque limits, armature, default pose, and spawn height are Unitree's A2 values from
+``src/assets/robots/unitree_a2/a2_constants.py`` of https://github.com/unitreerobotics/unitree_rl_mjlab,
+which match the gains and pose of its deployed velocity policy (``deploy/robots/a2``).
 """
 
 
