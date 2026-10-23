@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Train the study policies one after another inside the container.
 # Launch detached so it survives SSH disconnects:
-#   docker exec -d -u 0 isaac-lab-kitless-v3 bash -lc 'nohup bash /workspace/isaaclab/source/isaaclab_tasks/isaaclab_tasks/forge/go2_velocity/train_queue.sh > /workspace/isaaclab/logs/train_queue.log 2>&1'
+#   docker exec -d -u 0 isaac-lab-kitless-v3 bash -lc 'nohup bash /workspace/isaaclab/source/isaaclab_tasks/isaaclab_tasks/forge/velocity/go2_velocity/train_queue.sh > /workspace/isaaclab/logs/train_queue.log 2>&1'
 # Each run logs to /workspace/isaaclab/logs/<run_name>.log; a failed run does not stop the next one.
 
 cd /workspace/isaaclab || exit 1
