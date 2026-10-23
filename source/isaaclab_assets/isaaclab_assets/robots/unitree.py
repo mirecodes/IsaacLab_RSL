@@ -10,6 +10,7 @@ The following configurations are available:
 * :obj:`UNITREE_A1_CFG`: Unitree A1 robot with DC motor model for the legs
 * :obj:`UNITREE_GO1_CFG`: Unitree Go1 robot with actuator net model for the legs
 * :obj:`UNITREE_GO2_CFG`: Unitree Go2 robot with DC motor model for the legs
+* :obj:`UNITREE_A2_CFG`: Unitree A2 robot with DC motor model for the legs, from a locally stored asset
 * :obj:`H1_CFG`: H1 humanoid robot
 * :obj:`H1_MINIMAL_CFG`: H1 humanoid robot with minimal collision bodies
 * :obj:`G1_CFG`: G1 humanoid robot
@@ -28,6 +29,8 @@ from isaaclab.actuators import ActuatorNetMLPCfg, DCMotorCfg, IdealPDActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.utils import clone
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
+
+from isaaclab_assets import ISAACLAB_ASSETS_DATA_DIR
 
 HEALTHCARE_S3 = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/Healthcare/0.5.0/132c82d"
 
@@ -198,6 +201,73 @@ UNITREE_GO2_CFG = ArticulationCfg(
     },
 )
 """Configuration of Unitree Go2 using DC-Motor actuator model."""
+
+
+A2_LENGTH_SCALE = 0.275 / 0.213
+"""A2 / Go2 length scale, from the thigh and calf lengths (both legs segments are equal on each robot)."""
+
+A2_MASS_SCALE = 40.07 / 15.0
+"""A2 / Go2 mass scale, from the total link masses of the A2 URDF and Go2."""
+
+UNITREE_A2_CFG = ArticulationCfg(
+    # Pre-converted from ``urdf/a2.urdf`` (see ``usd/config.yaml`` for the converter settings): converting
+    # at spawn time fails under Newton, which does not register the PhysX schemas the URDF importer applies.
+    # The importer nests the links, e.g. ``Robot/Geometry/base_link/FL_hip/FL_thigh/FL_calf/FL_foot``,
+    # and the default "physics" variant keeps the joint drives that the actuator model below writes to.
+    spawn=sim_utils.UsdFileCfg(
+        usd_path=f"{ISAACLAB_ASSETS_DATA_DIR}/Robots/Unitree/A2/usd/a2/a2.usda",
+        activate_contact_sensors=True,
+        rigid_props=PhysxRigidBodyCfg(
+            disable_gravity=False,
+            retain_accelerations=False,
+            linear_damping=0.0,
+            angular_damping=0.0,
+            max_linear_velocity=1000.0,
+            max_angular_velocity=1000.0,
+            max_depenetration_velocity=1.0,
+        ),
+        articulation_props=[
+            PhysxArticulationCfg(
+                enabled_self_collisions=False, solver_position_iteration_count=4, solver_velocity_iteration_count=0
+            ),
+            NewtonArticulationCfg(self_collision_enabled=False),
+        ],
+    ),
+    # Go2's joint angles: both robots have equal thigh and calf lengths, so the stance is geometrically
+    # similar, and Go2's spawn height scaled by A2_LENGTH_SCALE.
+    init_state=ArticulationCfg.InitialStateCfg(
+        pos=(0.0, 0.0, 0.4 * A2_LENGTH_SCALE),
+        joint_pos={
+            ".*L_hip_joint": 0.1,
+            ".*R_hip_joint": -0.1,
+            "F[L,R]_thigh_joint": 0.8,
+            "R[L,R]_thigh_joint": 1.0,
+            ".*_calf_joint": -1.5,
+        },
+        joint_vel={".*": 0.0},
+    ),
+    soft_joint_pos_limit_factor=0.9,
+    actuators={
+        "base_legs": DCMotorCfg(
+            joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
+            # limits from ``a2.urdf``; the calf has a higher joint-side torque and lower speed, as on Go2
+            actuator_effort_limit={".*_hip_joint": 120.0, ".*_thigh_joint": 120.0, ".*_calf_joint": 180.0},
+            saturation_effort={".*_hip_joint": 120.0, ".*_thigh_joint": 120.0, ".*_calf_joint": 180.0},
+            actuator_velocity_limit={".*_hip_joint": 22.0, ".*_thigh_joint": 22.0, ".*_calf_joint": 14.67},
+            # Go2's 25 / 0.5 under dynamic similarity: stiffness ~ m * g * l, damping ~ stiffness * sqrt(l / g)
+            stiffness=25.0 * A2_MASS_SCALE * A2_LENGTH_SCALE,
+            damping=0.5 * A2_MASS_SCALE * A2_LENGTH_SCALE**1.5,
+            friction=0.0,
+            # rotor inertia from Unitree's ``a2.xml`` (unitree_mujoco)
+            armature=0.03,
+        ),
+    },
+)
+"""Configuration of Unitree A2 using DC-Motor actuator model.
+
+Asset source: ``robots/a2_description`` of https://github.com/unitreerobotics/unitree_ros (BSD-3-Clause),
+stored under ``data/Robots/Unitree/A2`` (see its ``README.md``) because A2 is not on Nucleus.
+"""
 
 
 H1_CFG = ArticulationCfg(

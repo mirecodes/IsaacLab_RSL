@@ -67,14 +67,20 @@ FEET_CFG = SceneEntityCfg("contact_forces", body_names=FEET, preserve_order=True
 LEGS_CFG = SceneEntityCfg("contact_forces", body_names=LEGS, preserve_order=True)
 
 
-def _foot_scanner(foot: str) -> RayCasterCfg:
-    """Foot-centered height samples: 52 rays on 5 circles, radii scaled to Go2."""
+def foot_scanner(foot_path: str, length_scale: float = 1.0) -> RayCasterCfg:
+    """Foot-centered height samples: 52 rays on 5 circles, radii scaled to Go2.
+
+    Args:
+        foot_path: Foot prim path below the robot prim, e.g. ``"FL_foot"``.
+        length_scale: Robot / Go2 length scale applied on top of :data:`GO2_SCALE`.
+    """
     return RayCasterCfg(
-        prim_path=f"{{ENV_REGEX_NS}}/Robot/{foot}",
+        prim_path=f"{{ENV_REGEX_NS}}/Robot/{foot_path}",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)),
         ray_alignment="yaw",
         pattern_cfg=study_mdp.ConcentricCirclesPatternCfg(
-            radii=tuple(r * GO2_SCALE for r in (0.08, 0.16, 0.26, 0.36, 0.48)), num_points=(6, 8, 10, 12, 16)
+            radii=tuple(r * GO2_SCALE * length_scale for r in (0.08, 0.16, 0.26, 0.36, 0.48)),
+            num_points=(6, 8, 10, 12, 16),
         ),
         max_distance=2.0,
         mesh_prim_paths=["/World/ground"],
@@ -82,8 +88,14 @@ def _foot_scanner(foot: str) -> RayCasterCfg:
     )
 
 
-def teacher_terrain_generator() -> terrain_gen.TerrainGeneratorCfg:
-    """The paper's terrain families with heights scaled to Go2, sorted into difficulty levels."""
+def teacher_terrain_generator(length_scale: float = 1.0) -> terrain_gen.TerrainGeneratorCfg:
+    """The paper's terrain families with heights scaled to Go2, sorted into difficulty levels.
+
+    Args:
+        length_scale: Robot / Go2 length scale. It multiplies every obstacle height and step or obstacle
+            width; the tile layout and spawn platforms are kept.
+    """
+    s = length_scale
     return terrain_gen.TerrainGeneratorCfg(
         size=(8.0, 8.0),
         border_width=20.0,
@@ -97,38 +109,42 @@ def teacher_terrain_generator() -> terrain_gen.TerrainGeneratorCfg:
         sub_terrains={
             # "rough": Perlin hills, approximated by smoothed uniform noise
             "hills": terrain_gen.HfRandomUniformTerrainCfg(
-                proportion=0.15, noise_range=(0.02, 0.15), noise_step=0.01, downsampled_scale=0.5, border_width=0.25
+                proportion=0.15,
+                noise_range=(0.02 * s, 0.15 * s),
+                noise_step=0.01,
+                downsampled_scale=0.5,
+                border_width=0.25,
             ),
             # "rough discrete": quantized rough terrain
             "rough_discrete": terrain_gen.HfRandomUniformTerrainCfg(
-                proportion=0.15, noise_range=(0.01, 0.06), noise_step=0.01, border_width=0.25
+                proportion=0.15, noise_range=(0.01 * s, 0.06 * s), noise_step=0.01, border_width=0.25
             ),
             # "large steps": two height levels, h in [0, 0.4] m
             "step_up": terrain_gen.MeshPitTerrainCfg(
-                proportion=0.075, pit_depth_range=(0.0, 0.4 * GO2_SCALE), platform_width=3.0
+                proportion=0.075, pit_depth_range=(0.0, 0.4 * GO2_SCALE * s), platform_width=3.0
             ),
             "step_down": terrain_gen.MeshBoxTerrainCfg(
-                proportion=0.075, box_height_range=(0.0, 0.4 * GO2_SCALE), platform_width=3.0
+                proportion=0.075, box_height_range=(0.0, 0.4 * GO2_SCALE * s), platform_width=3.0
             ),
             # "grid steps": h in [0.05, 0.4] m, d in [0.2, 0.7] m (the paper's evaluation ranges)
             "grid_steps": terrain_gen.MeshRandomGridTerrainCfg(
                 proportion=0.15,
-                grid_width=0.45 * GO2_SCALE,
-                grid_height_range=(0.05 * GO2_SCALE, 0.4 * GO2_SCALE),
+                grid_width=0.45 * GO2_SCALE * s,
+                grid_height_range=(0.05 * GO2_SCALE * s, 0.4 * GO2_SCALE * s),
                 platform_width=2.0,
             ),
             # "stairs": h in [0.01, 0.22] m, d in [0.25, 1.0] m
             "stairs_up": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
                 proportion=0.15,
-                step_height_range=(0.01 * GO2_SCALE, 0.22 * GO2_SCALE),
-                step_width=0.4 * GO2_SCALE,
+                step_height_range=(0.01 * GO2_SCALE * s, 0.22 * GO2_SCALE * s),
+                step_width=0.4 * GO2_SCALE * s,
                 platform_width=3.0,
                 border_width=1.0,
             ),
             "stairs_down": terrain_gen.MeshPyramidStairsTerrainCfg(
                 proportion=0.1,
-                step_height_range=(0.01 * GO2_SCALE, 0.22 * GO2_SCALE),
-                step_width=0.4 * GO2_SCALE,
+                step_height_range=(0.01 * GO2_SCALE * s, 0.22 * GO2_SCALE * s),
+                step_width=0.4 * GO2_SCALE * s,
                 platform_width=3.0,
                 border_width=1.0,
             ),
@@ -136,8 +152,8 @@ def teacher_terrain_generator() -> terrain_gen.TerrainGeneratorCfg:
             "boxes": terrain_gen.HfDiscreteObstaclesTerrainCfg(
                 proportion=0.15,
                 obstacle_height_mode="choice",
-                obstacle_width_range=(0.3, 1.0),
-                obstacle_height_range=(0.03, 0.25 * GO2_SCALE),
+                obstacle_width_range=(0.3 * s, 1.0 * s),
+                obstacle_height_range=(0.03 * s, 0.25 * GO2_SCALE * s),
                 num_obstacles=40,
                 platform_width=2.0,
                 border_width=0.25,
@@ -150,10 +166,10 @@ def teacher_terrain_generator() -> terrain_gen.TerrainGeneratorCfg:
 class TeacherSceneCfg(MySceneCfg):
     """Stock velocity scene plus one height scanner per foot."""
 
-    foot_scanner_FL = _foot_scanner("FL_foot")
-    foot_scanner_FR = _foot_scanner("FR_foot")
-    foot_scanner_RL = _foot_scanner("RL_foot")
-    foot_scanner_RR = _foot_scanner("RR_foot")
+    foot_scanner_FL = foot_scanner("FL_foot")
+    foot_scanner_FR = foot_scanner("FR_foot")
+    foot_scanner_RL = foot_scanner("RL_foot")
+    foot_scanner_RR = foot_scanner("RR_foot")
 
 
 @configclass
