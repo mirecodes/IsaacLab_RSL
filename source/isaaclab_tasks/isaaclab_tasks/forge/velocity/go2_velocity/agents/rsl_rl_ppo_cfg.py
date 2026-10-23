@@ -14,7 +14,7 @@ class Go2StudyBasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     num_steps_per_env = 24
     max_iterations = 1500
-    save_interval = 50
+    save_interval = 100
     experiment_name = "go2_study_base"
     # used only with --logger wandb
     wandb_project = "go2_study"
