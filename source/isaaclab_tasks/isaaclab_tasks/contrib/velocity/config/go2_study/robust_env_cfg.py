@@ -360,23 +360,41 @@ class Go2RobustTeacherEnvCfg(Go2StudyBaseEnvCfg):
         self.events.base_external_force_torque.params["torque_range"] = (-3.0, 3.0)
 
         # -- rewards: 2 x the paper's coefficients (see module docstring)
+        # Source: Miki et al. 2022, Sec. S7 (ANYmal C). Each weight is written as 2 x <paper coefficient> x <scaling>:
+        # the factor 2 brings the paper's tracking weight 0.75 to the stock Go2 task's per-second 1.5. Terms marked
+        # [curriculum] are further multiplied by the exponential curriculum factor (c_0 = 0.3 -> 1, see
+        # TeacherCurriculumCfg), as in the paper.
+        # Velocities scale with sqrt(length) by Froude similarity, so each velocity std (1 on ANYmal) is
+        # sqrt(GO2_SCALE).
         velocity_std = math.sqrt(GO2_SCALE)
         rewards = self.rewards
+        # r_lv, r_av, r_lvo: paper 0.75 each, unscaled; the std is scaled instead
         for name in ("track_lin_vel", "track_ang_vel", "lin_vel_orthogonal"):
             getattr(rewards, name).weight = 2 * 0.75
         rewards.track_lin_vel.params["std"] = velocity_std
         rewards.track_ang_vel.params["std"] = velocity_std
         rewards.lin_vel_orthogonal.params["std"] = velocity_std
+        # r_b (base motion, 1.25 v_z^2 + 0.4 |w_x| + 0.4 |w_y|): paper 1.0, unscaled
         rewards.body_motion.weight = -2 * 1.0
+        # r_fc (feet above a terrain drop): paper 0.003, unscaled; the paper's 0.2 m threshold is scaled by GO2_SCALE
         rewards.foot_clearance.weight = -2 * 0.003
+        # r_bc (leg-body collisions) [curriculum]: paper 0.1, unscaled
         rewards.leg_collision.weight = -2 * 0.1
+        # r_jm joint-velocity part [curriculum]: paper 0.001 on 0.01 |q_dot|^2, unscaled
         rewards.joint_vel_l2.weight = -2 * 0.001 * 0.01
+        # r_jm joint-acceleration part [curriculum]: NOT the paper's 0.001 on |q_ddot|^2, which dominates every
+        # other term on raw accelerations [rad^2/s^4]; Isaac Lab's shared -2.5e-7 instead
         rewards.dof_acc_l2.weight = -2.5e-7
+        # r_jc (knee past q_th): paper 0.08, unscaled; q_th = -1.0 rad is chosen here (see TeacherRewardsCfg)
         rewards.knee_constraint.weight = -2 * 0.08
+        # r_s (first and second differences of joint targets) [curriculum]: paper 0.003, unscaled
         rewards.target_smoothness.weight = -2 * 0.003
-        # ANYmal's 80 N*m peak torque vs. Go2's ~30 N*m
+        # r_tau (|tau|^2) [curriculum]: paper 1e-6 x (ANYmal's 80 N*m / Go2's ~30 N*m peak torque)^2, so the same
+        # fraction of the peak torque costs the same as on ANYmal
         rewards.dof_torques_l2.weight = -2 * 1.0e-6 * (80.0 / 30.0) ** 2
+        # r_slip (|v_foot|^2 of feet in contact) [curriculum]: paper 0.003, unscaled
         rewards.foot_slip.weight = -2 * 0.003
+        # base_height_l2 (not in the paper): the stock Go2 term and weight -30 are kept, see module docstring
         # replaced by the terms above
         rewards.track_lin_vel_xy_exp = None
         rewards.track_ang_vel_z_exp = None

@@ -34,6 +34,7 @@ from isaaclab.utils import configclass, replace
 
 from isaaclab_assets.robots.unitree import UNITREE_A2_CFG
 
+from ..go2_study.base_env_cfg import Go2StudyBaseEnvCfg
 from ..go2_study.robust_env_cfg import (
     FEET,
     GO2_SCALE,
@@ -70,6 +71,24 @@ FOOT_PATHS = {foot: f"Geometry/{BASE}/{foot[:2]}_hip/{foot[:2]}_thigh/{foot[:2]}
 """Foot prim paths below the robot prim."""
 
 
+def use_a2_asset(cfg: Go2StudyBaseEnvCfg):
+    """Swap a Go2 study config's robot for A2 and point its base-body references at A2's prim layout.
+
+    Terms a scenario removed (set to ``None``) are skipped.
+    """
+    cfg.scene.robot = replace(UNITREE_A2_CFG, prim_path="{ENV_REGEX_NS}/Robot")
+    cfg.scene.height_scanner.prim_path = f"{{ENV_REGEX_NS}}/Robot/Geometry/{BASE}"
+    # body-level sensing only matches rigid bodies, so this skips the collision and visual prims
+    cfg.scene.contact_forces.prim_path = "{ENV_REGEX_NS}/Robot/Geometry/.*"
+    for event in ("add_base_mass", "base_com", "base_external_force_torque"):
+        if (term := getattr(cfg.events, event)) is not None:
+            term.params["asset_cfg"] = SceneEntityCfg("robot", body_names=BASE)
+    if cfg.terminations.base_contact is not None:
+        cfg.terminations.base_contact.params["sensor_cfg"].body_names = BASE
+    if cfg.rewards.base_height_l2 is not None:
+        cfg.rewards.base_height_l2.params["target_height"] = A2_STANDING_HEIGHT
+
+
 @configclass
 class A2TeacherSceneCfg(TeacherSceneCfg):
     """Go2 teacher scene with the foot scanners on A2's nested feet and radii scaled to A2."""
@@ -90,14 +109,8 @@ class A2RobustTeacherEnvCfg(Go2RobustTeacherEnvCfg):
         super().__post_init__()
 
         # -- robot and sensors on the imported asset's prim layout
-        self.scene.robot = replace(UNITREE_A2_CFG, prim_path="{ENV_REGEX_NS}/Robot")
-        self.scene.height_scanner.prim_path = f"{{ENV_REGEX_NS}}/Robot/Geometry/{BASE}"
-        # body-level sensing only matches rigid bodies, so this skips the collision and visual prims
-        self.scene.contact_forces.prim_path = "{ENV_REGEX_NS}/Robot/Geometry/.*"
-        for event in ("add_base_mass", "base_com", "base_external_force_torque"):
-            getattr(self.events, event).params["asset_cfg"] = SceneEntityCfg("robot", body_names=BASE)
+        use_a2_asset(self)
         self.observations.policy.external_wrench.params["asset_cfg"] = SceneEntityCfg("robot", body_names=BASE)
-        self.terminations.base_contact.params["sensor_cfg"].body_names = BASE
 
         # -- actions: A2 leg geometry, swing height and base frequency scaled from ANYmal
         cpg = self.actions.joint_pos
@@ -118,13 +131,19 @@ class A2RobustTeacherEnvCfg(Go2RobustTeacherEnvCfg):
         self.events.base_external_force_torque.params["torque_range"] = (-torque, torque)
 
         # -- rewards: Go2's weights with A2's scale
+        # Source: Miki et al. 2022, Sec. S7, via the Go2 teacher: every weight is inherited as 2 x the paper's
+        # coefficient (see Go2RobustTeacherEnvCfg). Weights the Go2 teacher leaves unscaled (tracking, r_b, r_fc,
+        # r_bc, r_jm, r_jc, r_s, r_slip) stay the same; only the robot-size-dependent values are re-scaled from
+        # ANYmal with A2_SCALE in place of GO2_SCALE:
+        # velocity std: sqrt(A2_SCALE) by Froude similarity (1 on ANYmal)
         velocity_std = math.sqrt(A2_SCALE)
         rewards = self.rewards
         rewards.track_lin_vel.params["std"] = velocity_std
         rewards.track_ang_vel.params["std"] = velocity_std
         rewards.lin_vel_orthogonal.params["std"] = velocity_std
+        # r_fc threshold: the paper's 0.2 m x A2_SCALE
         rewards.foot_clearance.params["threshold"] = 0.2 * A2_SCALE
-        # ANYmal's 80 N*m peak torque vs. A2's ~140 N*m (120 N*m hip and thigh, 180 N*m calf; Go2's ~30 N*m
-        # is the same joint average of 23.7 and 45.4 N*m)
+        # r_tau: paper 1e-6 x (ANYmal's 80 N*m / A2's ~140 N*m peak torque)^2 (120 N*m hip and thigh, 180 N*m calf;
+        # Go2's ~30 N*m is the same joint average of 23.7 and 45.4 N*m)
         rewards.dof_torques_l2.weight = -2 * 1.0e-6 * (80.0 / 140.0) ** 2
-        rewards.base_height_l2.params["target_height"] = A2_STANDING_HEIGHT
+        # base_height_l2 (not in the paper): weight -30 inherited; target A2_STANDING_HEIGHT, set in use_a2_asset

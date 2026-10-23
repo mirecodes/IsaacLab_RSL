@@ -234,11 +234,17 @@ class Go2EnergyTeacherEnvCfg(Go2StudyBaseEnvCfg):
         self.terminations.base_contact = None
 
         # -- rewards: the paper's coefficients (see module docstring)
+        # Source: Fu et al. 2021, Eq. 3-5 (A1), r = r_forward + 0.04 r_energy + r_alive. All weights are the paper's
+        # per-step coefficients, unscaled for Go2 (Go2/A1 mass 1.25, length 1.07). Isaac Lab multiplies them by the
+        # 0.02 s step, which keeps every ratio between the terms.
         rewards = self.rewards
+        # r_forward = -20 |v_x - v_x^target| - v_y^2 - w_yaw^2: paper -20, -1, -1
         rewards.forward_vel_error.weight = -20.0
         rewards.lateral_vel.weight = -1.0
         rewards.yaw_rate.weight = -1.0
+        # 0.04 r_energy, r_energy = -tau^T q_dot [W] (signed, so regenerative motion is rewarded): paper 0.04
         rewards.energy.weight = -0.04
+        # r_alive = 20 v_x^target: paper 20 x the 0.9 m/s target, so standing still scores 0 with r_forward
         rewards.alive.weight = 20.0 * TARGET_SPEED
         # the paper uses no other terms
         for name in (
