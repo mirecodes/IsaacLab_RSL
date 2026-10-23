@@ -47,6 +47,14 @@ class A2StudyBasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
+class A2SteeringPPORunnerCfg(A2StudyBasePPORunnerCfg):
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "a2_study_steering"
+
+
+@configclass
 class A2RobustTeacherPPORunnerCfg(A2StudyBasePPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()

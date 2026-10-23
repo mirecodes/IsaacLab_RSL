@@ -24,6 +24,16 @@ gym.register(
 )
 
 gym.register(
+    id="IsaacContrib-Velocity-A2Study-Steering",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.steering_env_cfg:A2SteeringEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:A2SteeringPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="IsaacContrib-Velocity-A2Study-RobustTeacher",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

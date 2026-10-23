@@ -4,4 +4,8 @@
           - type: bind
             source: ${HOME}/hyeslee/codes
             target: /workspace/codes
+          # fetched Euler results (`euler fetch`), e.g. fault_analysis collections for render.py
+          - type: bind
+            source: ${HOME}/hyeslee/results
+            target: /workspace/results
         user: "0:0"

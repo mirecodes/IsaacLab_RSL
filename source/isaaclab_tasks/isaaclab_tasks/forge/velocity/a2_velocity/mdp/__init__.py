@@ -9,6 +9,7 @@ A copy of the Go2 study's terms (``go2_velocity/mdp``), kept here so that ``a2_v
 """
 
 from .actions import CPGJointPositionAction, CPGJointPositionActionCfg
+from .commands import SteeringVelocityCommand, SteeringVelocityCommandCfg
 from .curriculums import exponential_curriculum_factor
 from .events import randomize_foot_friction, randomize_pd_gains
 from .observations import (
