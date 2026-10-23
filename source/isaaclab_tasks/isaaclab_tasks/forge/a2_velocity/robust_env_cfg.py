@@ -3,30 +3,35 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Robust Go2 policy: the teacher stage of Miki et al. 2022, "Learning robust perceptive locomotion
-for quadrupedal robots in the wild" (Science Robotics), adapted to Go2.
+"""Robust A2 policy: the teacher stage of Miki et al. 2022, "Learning robust perceptive locomotion
+for quadrupedal robots in the wild" (Science Robotics), adapted to Unitree A2 as the Go2 study adapts it to Go2.
 
 Follows the paper's teacher: CPG action space, proprioception + noiseless foot-centered height samples +
 privileged state, the Sec. S7 reward, an exponential curriculum on selected rewards and disturbances,
 and the paper's terrain families and domain randomization.
 
-Deviations, either forced by Isaac Lab or not stated in the paper:
+Deviations, either forced by Isaac Lab or not stated in the paper (shared with the Go2 study):
 
-* Lengths, heights, and the swing height are scaled from ANYmal to Go2 by :data:`GO2_SCALE` (nominal
-  base heights 0.4 m vs. 0.6 m); torque weight by the squared ratio of peak joint torques; the base
+* Lengths, heights, and the swing height are scaled from ANYmal to A2 by :data:`~.base_env_cfg.A2_SCALE`;
+  the tracking std by sqrt(A2_SCALE); torque weight by the squared ratio of peak joint torques; the base
   frequency by Froude similarity.
+* Values the Go2 study chose for Go2 rather than taking from the paper (hill and rough-terrain noise,
+  box widths and minimum height, the external wrench's lever arm) are scaled by
+  :data:`~.base_env_cfg.GO2_TO_A2`. The external force is about 0.2 x the robot's weight, as for Go2.
 * Reward weights are the paper's coefficients times 2 so the tracking terms match the stock Go2 task's
   per-second scale (Isaac Lab multiplies weights by the 0.02 s step).
 * The joint-acceleration penalty keeps Isaac Lab's weight: the paper's 0.001 on raw accelerations
   [rad^2/s^4] would dominate every other term.
 * Terrain curriculum: Isaac Lab's distance-based terrain levels instead of the particle-filter curriculum.
   Perlin hills are approximated by smoothed uniform noise.
-* No torque-limit termination: Go2's DC-motor model saturates routinely, and Isaac Lab clips the torque.
+* No torque-limit termination: the DC-motor model saturates routinely, and Isaac Lab clips the torque.
 * Leg frequencies are bounded to [0.5, 1.5] x f_0, so the legs always step. With the full [0, 2] x f_0
-  range the policy froze its CPG and stood still (iteration 300: phase action -0.91, 0.03 m/s forward).
+  range the Go2 policy froze its CPG and stood still (iteration 300: phase action -0.91, 0.03 m/s forward).
 * Ranges the paper leaves unstated (friction, masses, external wrench, knee threshold, c_0) are chosen
   here and marked below.
-* The stock Go2 base-height penalty is kept: without it Go2 learns to rest on its legs.
+* The base-height penalty of :class:`~.base_env_cfg.A2StudyBaseEnvCfg` is kept.
+* The large and grid steps reach 0.35 m at the top difficulty level, above A2's rated 0.30 m step height.
+  They are kept as the curriculum ceiling, as the paper's 0.4 m is for ANYmal.
 """
 
 import math
@@ -43,21 +48,20 @@ from isaaclab.sensors import RayCasterCfg
 from isaaclab.utils import configclass
 
 from isaaclab_tasks.core.velocity import mdp
-from isaaclab_tasks.core.velocity.config.go2.rough_env_cfg import UnitreeGo2Rewards
 from isaaclab_tasks.core.velocity.velocity_env_cfg import CurriculumCfg, EventsCfg, MySceneCfg, TerminationsCfg
 
 from . import mdp as study_mdp
-from .base_env_cfg import Go2StudyBaseEnvCfg
-
-GO2_SCALE = 0.4 / 0.6
-"""Go2 / ANYmal length scale, from the nominal standing base heights."""
+from .base_env_cfg import A2_MASS, A2_SCALE, BASE, GO2_TO_A2, A2StudyBaseEnvCfg, BaseRewardsCfg
 
 FEET = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
 LEGS = ["FL_thigh", "FR_thigh", "RL_thigh", "RR_thigh", "FL_calf", "FR_calf", "RL_calf", "RR_calf"]
 LEG_JOINTS = [f"{leg}_{joint}_joint" for leg in ("FL", "FR", "RL", "RR") for joint in ("hip", "thigh", "calf")]
 FOOT_SCANNERS = [f"foot_scanner_{foot[:2]}" for foot in FEET]
 
-BASE_FREQUENCY = 1.25 / math.sqrt(GO2_SCALE)
+FOOT_PATHS = {foot: f"Geometry/{BASE}/{foot[:2]}_hip/{foot[:2]}_thigh/{foot[:2]}_calf/{foot}" for foot in FEET}
+"""Foot prim paths below the robot prim (the A2 importer nests the links)."""
+
+A2_BASE_FREQUENCY = 1.25 / math.sqrt(A2_SCALE)
 """CPG base frequency [Hz]: 1.25 Hz (Lee et al. 2020, ANYmal) scaled by Froude similarity."""
 
 STEP_DT = 0.02
@@ -67,19 +71,18 @@ FEET_CFG = SceneEntityCfg("contact_forces", body_names=FEET, preserve_order=True
 LEGS_CFG = SceneEntityCfg("contact_forces", body_names=LEGS, preserve_order=True)
 
 
-def foot_scanner(foot_path: str, length_scale: float = 1.0) -> RayCasterCfg:
-    """Foot-centered height samples: 52 rays on 5 circles, radii scaled to Go2.
+def foot_scanner(foot_path: str) -> RayCasterCfg:
+    """Foot-centered height samples: 52 rays on 5 circles, the paper's radii scaled to A2.
 
     Args:
-        foot_path: Foot prim path below the robot prim, e.g. ``"FL_foot"``.
-        length_scale: Robot / Go2 length scale applied on top of :data:`GO2_SCALE`.
+        foot_path: Foot prim path below the robot prim, see :data:`FOOT_PATHS`.
     """
     return RayCasterCfg(
         prim_path=f"{{ENV_REGEX_NS}}/Robot/{foot_path}",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)),
         ray_alignment="yaw",
         pattern_cfg=study_mdp.ConcentricCirclesPatternCfg(
-            radii=tuple(r * GO2_SCALE * length_scale for r in (0.08, 0.16, 0.26, 0.36, 0.48)),
+            radii=tuple(r * A2_SCALE for r in (0.08, 0.16, 0.26, 0.36, 0.48)),
             num_points=(6, 8, 10, 12, 16),
         ),
         max_distance=2.0,
@@ -88,14 +91,13 @@ def foot_scanner(foot_path: str, length_scale: float = 1.0) -> RayCasterCfg:
     )
 
 
-def teacher_terrain_generator(length_scale: float = 1.0) -> terrain_gen.TerrainGeneratorCfg:
-    """The paper's terrain families with heights scaled to Go2, sorted into difficulty levels.
+def teacher_terrain_generator() -> terrain_gen.TerrainGeneratorCfg:
+    """The paper's terrain families with heights scaled to A2, sorted into difficulty levels.
 
-    Args:
-        length_scale: Robot / Go2 length scale. It multiplies every obstacle height and step or obstacle
-            width; the tile layout and spawn platforms are kept.
+    The paper's heights and widths are scaled by :data:`A2_SCALE`, values the Go2 study chose for Go2 by
+    :data:`GO2_TO_A2`; the tile layout and spawn platforms are kept.
     """
-    s = length_scale
+    s = GO2_TO_A2
     return terrain_gen.TerrainGeneratorCfg(
         size=(8.0, 8.0),
         border_width=20.0,
@@ -121,30 +123,30 @@ def teacher_terrain_generator(length_scale: float = 1.0) -> terrain_gen.TerrainG
             ),
             # "large steps": two height levels, h in [0, 0.4] m
             "step_up": terrain_gen.MeshPitTerrainCfg(
-                proportion=0.075, pit_depth_range=(0.0, 0.4 * GO2_SCALE * s), platform_width=3.0
+                proportion=0.075, pit_depth_range=(0.0, 0.4 * A2_SCALE), platform_width=3.0
             ),
             "step_down": terrain_gen.MeshBoxTerrainCfg(
-                proportion=0.075, box_height_range=(0.0, 0.4 * GO2_SCALE * s), platform_width=3.0
+                proportion=0.075, box_height_range=(0.0, 0.4 * A2_SCALE), platform_width=3.0
             ),
             # "grid steps": h in [0.05, 0.4] m, d in [0.2, 0.7] m (the paper's evaluation ranges)
             "grid_steps": terrain_gen.MeshRandomGridTerrainCfg(
                 proportion=0.15,
-                grid_width=0.45 * GO2_SCALE * s,
-                grid_height_range=(0.05 * GO2_SCALE * s, 0.4 * GO2_SCALE * s),
+                grid_width=0.45 * A2_SCALE,
+                grid_height_range=(0.05 * A2_SCALE, 0.4 * A2_SCALE),
                 platform_width=2.0,
             ),
             # "stairs": h in [0.01, 0.22] m, d in [0.25, 1.0] m
             "stairs_up": terrain_gen.MeshInvertedPyramidStairsTerrainCfg(
                 proportion=0.15,
-                step_height_range=(0.01 * GO2_SCALE * s, 0.22 * GO2_SCALE * s),
-                step_width=0.4 * GO2_SCALE * s,
+                step_height_range=(0.01 * A2_SCALE, 0.22 * A2_SCALE),
+                step_width=0.4 * A2_SCALE,
                 platform_width=3.0,
                 border_width=1.0,
             ),
             "stairs_down": terrain_gen.MeshPyramidStairsTerrainCfg(
                 proportion=0.1,
-                step_height_range=(0.01 * GO2_SCALE * s, 0.22 * GO2_SCALE * s),
-                step_width=0.4 * GO2_SCALE * s,
+                step_height_range=(0.01 * A2_SCALE, 0.22 * A2_SCALE),
+                step_width=0.4 * A2_SCALE,
                 platform_width=3.0,
                 border_width=1.0,
             ),
@@ -153,7 +155,7 @@ def teacher_terrain_generator(length_scale: float = 1.0) -> terrain_gen.TerrainG
                 proportion=0.15,
                 obstacle_height_mode="choice",
                 obstacle_width_range=(0.3 * s, 1.0 * s),
-                obstacle_height_range=(0.03 * s, 0.25 * GO2_SCALE * s),
+                obstacle_height_range=(0.03 * s, 0.25 * A2_SCALE),
                 num_obstacles=40,
                 platform_width=2.0,
                 border_width=0.25,
@@ -166,10 +168,10 @@ def teacher_terrain_generator(length_scale: float = 1.0) -> terrain_gen.TerrainG
 class TeacherSceneCfg(MySceneCfg):
     """Stock velocity scene plus one height scanner per foot."""
 
-    foot_scanner_FL = foot_scanner("FL_foot")
-    foot_scanner_FR = foot_scanner("FR_foot")
-    foot_scanner_RL = foot_scanner("RL_foot")
-    foot_scanner_RR = foot_scanner("RR_foot")
+    foot_scanner_FL = foot_scanner(FOOT_PATHS["FL_foot"])
+    foot_scanner_FR = foot_scanner(FOOT_PATHS["FR_foot"])
+    foot_scanner_RL = foot_scanner(FOOT_PATHS["RL_foot"])
+    foot_scanner_RR = foot_scanner(FOOT_PATHS["RR_foot"])
 
 
 @configclass
@@ -201,7 +203,7 @@ class TeacherObservationsCfg:
         leg_contact = ObsTerm(func=study_mdp.contact_states, params={"sensor_cfg": LEGS_CFG})
         external_wrench = ObsTerm(
             func=study_mdp.external_wrench_b,
-            params={"asset_cfg": SceneEntityCfg("robot", body_names="base")},
+            params={"asset_cfg": SceneEntityCfg("robot", body_names=BASE)},
             scale=0.05,
         )
         foot_air_time = ObsTerm(func=study_mdp.air_time, params={"sensor_cfg": FEET_CFG})
@@ -242,8 +244,8 @@ class TeacherEventsCfg(EventsCfg):
 
 
 @configclass
-class TeacherRewardsCfg(UnitreeGo2Rewards):
-    """Miki et al. 2022 Sec. S7 reward. Weights are set in :class:`Go2RobustTeacherEnvCfg`."""
+class TeacherRewardsCfg(BaseRewardsCfg):
+    """Miki et al. 2022 Sec. S7 reward. Weights are set in :class:`A2RobustTeacherEnvCfg`."""
 
     track_lin_vel = RewTerm(
         func=study_mdp.track_lin_vel_saturated, weight=0.0, params={"command_name": "base_velocity"}
@@ -256,14 +258,15 @@ class TeacherRewardsCfg(UnitreeGo2Rewards):
     )
     body_motion = RewTerm(func=study_mdp.body_motion, weight=0.0)
     foot_clearance = RewTerm(
-        func=study_mdp.foot_clearance, weight=0.0, params={"sensor_names": FOOT_SCANNERS, "threshold": 0.2 * GO2_SCALE}
+        func=study_mdp.foot_clearance, weight=0.0, params={"sensor_names": FOOT_SCANNERS, "threshold": 0.2 * A2_SCALE}
     )
     leg_collision = RewTerm(func=mdp.undesired_contacts, weight=0.0, params={"sensor_cfg": LEGS_CFG, "threshold": 1.0})
     joint_vel_l2 = RewTerm(func=mdp.joint_vel_l2, weight=0.0)
     knee_constraint = RewTerm(
         func=study_mdp.joint_upper_threshold_l2,
         weight=0.0,
-        # not stated in the paper: keep Go2's knee (calf range [-2.72, -0.84] rad) away from full extension
+        # not stated in the paper: the Go2 study's threshold (Go2 calf range [-2.72, -0.84] rad), kept for A2;
+        # keeps the knee away from full extension
         params={"threshold": -1.0, "asset_cfg": SceneEntityCfg("robot", joint_names=".*_calf_joint")},
     )
     target_smoothness = RewTerm(func=study_mdp.joint_target_smoothness, weight=0.0)
@@ -306,8 +309,8 @@ class TeacherCurriculumCfg(CurriculumCfg):
 
 
 @configclass
-class Go2RobustTeacherEnvCfg(Go2StudyBaseEnvCfg):
-    """Go2 teacher policy after Miki et al. 2022."""
+class A2RobustTeacherEnvCfg(A2StudyBaseEnvCfg):
+    """A2 teacher policy after Miki et al. 2022."""
 
     scene: TeacherSceneCfg = TeacherSceneCfg(num_envs=4096, env_spacing=2.5)
     observations: TeacherObservationsCfg = TeacherObservationsCfg()
@@ -323,22 +326,23 @@ class Go2RobustTeacherEnvCfg(Go2StudyBaseEnvCfg):
         for name in FOOT_SCANNERS:
             getattr(self.scene, name).update_period = self.decimation * self.sim.dt
 
-        # -- actions: CPG phase offsets (4) + residual joint targets (12)
+        # -- actions: CPG phase offsets (4) + residual joint targets (12); A2 leg geometry, swing height and base
+        # frequency scaled from ANYmal
         self.actions.joint_pos = study_mdp.CPGJointPositionActionCfg(
             asset_name="robot",
             joint_names=LEG_JOINTS,
-            thigh_length=0.213,
-            calf_length=0.213,
-            base_frequency=BASE_FREQUENCY,
-            swing_height=0.2 * GO2_SCALE,
+            thigh_length=0.275,
+            calf_length=0.275,
+            base_frequency=A2_BASE_FREQUENCY,
+            swing_height=0.2 * A2_SCALE,
             initial_phase=(0.0, math.pi, math.pi, 0.0),
-            # a unit action spans leg frequencies [0.5 * f_0, 1.5 * f_0]; with [0, 2 * f_0] the policy froze
+            # a unit action spans leg frequencies [0.5 * f_0, 1.5 * f_0]; with [0, 2 * f_0] the Go2 policy froze
             # its legs (phase action -> -1) and stood still instead of learning to walk
-            phase_offset_scale=0.5 * 2.0 * math.pi * BASE_FREQUENCY * STEP_DT,
+            phase_offset_scale=0.5 * 2.0 * math.pi * A2_BASE_FREQUENCY * STEP_DT,
             residual_scale=0.25,
         )
 
-        # -- terrain: the paper's families, heights scaled to Go2
+        # -- terrain: the paper's families, heights scaled to A2
         self.scene.terrain.terrain_generator = teacher_terrain_generator()
 
         # -- domain randomization
@@ -352,12 +356,15 @@ class Go2RobustTeacherEnvCfg(Go2StudyBaseEnvCfg):
             mode="reset",
             params={"position_range": (-0.25, 0.25), "velocity_range": (-1.0, 1.0)},
         )
-        # external wrench on the base, resampled during the episode (magnitudes not stated in the paper;
-        # 30 N is about 0.2 x Go2's weight) and scaled by the curriculum factor
+        # external wrench on the base, resampled during the episode and scaled by the curriculum factor
+        # (magnitudes not stated in the paper): about 0.2 x A2's weight, as for Go2; the torque keeps the Go2
+        # study's 0.1 m lever arm, scaled to A2
+        force = 0.2 * A2_MASS * 9.81
+        torque = 0.1 * GO2_TO_A2 * force
         self.events.base_external_force_torque.mode = "interval"
         self.events.base_external_force_torque.interval_range_s = (2.0, 6.0)
-        self.events.base_external_force_torque.params["force_range"] = (-30.0, 30.0)
-        self.events.base_external_force_torque.params["torque_range"] = (-3.0, 3.0)
+        self.events.base_external_force_torque.params["force_range"] = (-force, force)
+        self.events.base_external_force_torque.params["torque_range"] = (-torque, torque)
 
         # -- rewards: 2 x the paper's coefficients (see module docstring)
         # Source: Miki et al. 2022, Sec. S7 (ANYmal C). Each weight is written as 2 x <paper coefficient> x <scaling>:
@@ -365,8 +372,8 @@ class Go2RobustTeacherEnvCfg(Go2StudyBaseEnvCfg):
         # [curriculum] are further multiplied by the exponential curriculum factor (c_0 = 0.3 -> 1, see
         # TeacherCurriculumCfg), as in the paper.
         # Velocities scale with sqrt(length) by Froude similarity, so each velocity std (1 on ANYmal) is
-        # sqrt(GO2_SCALE).
-        velocity_std = math.sqrt(GO2_SCALE)
+        # sqrt(A2_SCALE).
+        velocity_std = math.sqrt(A2_SCALE)
         rewards = self.rewards
         # r_lv, r_av, r_lvo: paper 0.75 each, unscaled; the std is scaled instead
         for name in ("track_lin_vel", "track_ang_vel", "lin_vel_orthogonal"):
@@ -376,7 +383,7 @@ class Go2RobustTeacherEnvCfg(Go2StudyBaseEnvCfg):
         rewards.lin_vel_orthogonal.params["std"] = velocity_std
         # r_b (base motion, 1.25 v_z^2 + 0.4 |w_x| + 0.4 |w_y|): paper 1.0, unscaled
         rewards.body_motion.weight = -2 * 1.0
-        # r_fc (feet above a terrain drop): paper 0.003, unscaled; the paper's 0.2 m threshold is scaled by GO2_SCALE
+        # r_fc (feet above a terrain drop): paper 0.003, unscaled; the paper's 0.2 m threshold is scaled by A2_SCALE
         rewards.foot_clearance.weight = -2 * 0.003
         # r_bc (leg-body collisions) [curriculum]: paper 0.1, unscaled
         rewards.leg_collision.weight = -2 * 0.1
@@ -389,12 +396,12 @@ class Go2RobustTeacherEnvCfg(Go2StudyBaseEnvCfg):
         rewards.knee_constraint.weight = -2 * 0.08
         # r_s (first and second differences of joint targets) [curriculum]: paper 0.003, unscaled
         rewards.target_smoothness.weight = -2 * 0.003
-        # r_tau (|tau|^2) [curriculum]: paper 1e-6 x (ANYmal's 80 N*m / Go2's ~30 N*m peak torque)^2, so the same
-        # fraction of the peak torque costs the same as on ANYmal
-        rewards.dof_torques_l2.weight = -2 * 1.0e-6 * (80.0 / 30.0) ** 2
+        # r_tau (|tau|^2) [curriculum]: paper 1e-6 x (ANYmal's 80 N*m / A2's ~140 N*m peak torque)^2, so the same
+        # fraction of the peak torque costs the same as on ANYmal (A2: 120 N*m hip and thigh, 180 N*m calf)
+        rewards.dof_torques_l2.weight = -2 * 1.0e-6 * (80.0 / 140.0) ** 2
         # r_slip (|v_foot|^2 of feet in contact) [curriculum]: paper 0.003, unscaled
         rewards.foot_slip.weight = -2 * 0.003
-        # base_height_l2 (not in the paper): the stock Go2 term and weight -30 are kept, see module docstring
+        # base_height_l2 (not in the paper): the base task's term and weight -30 are kept, see module docstring
         # replaced by the terms above
         rewards.track_lin_vel_xy_exp = None
         rewards.track_ang_vel_z_exp = None
