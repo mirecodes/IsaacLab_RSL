@@ -7,7 +7,7 @@
 
 Newton (MuJoCo-Warp) only: shape properties are written into the Newton model, see ``REPORT.md`` for how each
 interaction maps onto MuJoCo's contact model. Only the parts the terrain type needs run: slip on ``slip`` terrain,
-sand drag where there are sand patches, collapse where there are crusts, rock upkeep where there are dynamic rocks.
+sand drag where there are sand patches, collapse where there are crusts, stone upkeep where there are stones.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def interp(pair: tuple[float, float], difficulty: torch.Tensor) -> torch.Tensor:
 
 
 class terrain_step(ManagerTermBase):
-    """Slip friction, sand drag, crust collapse, and rock upkeep of the terrain map.
+    """Slip friction, sand drag, crust collapse, and stone upkeep of the terrain map.
 
     Run as an ``interval`` event every step (``interval_range_s=(0, 0)``, global time) and on resets via
     :meth:`reset`. At construction it sets the static contact parameters: terrain friction, sand-slab stiffness
@@ -110,8 +110,6 @@ class terrain_step(ManagerTermBase):
                 self.slab_shape[patch_ids[tuple(int(g) for g in match.groups())]] = i
                 if priority[i] < 1:
                     raise RuntimeError(f"Sand slab '{label}' lost its 'mjc:priority' on import.")
-            elif f"{terrain_path}/rocks/" in label:
-                mu[i] = 0.7  # static rocks: about the middle of the dynamic rocks' friction range
             else:
                 ground.append(i)
         mu[ground] = world.slip.ground_mu
@@ -149,8 +147,9 @@ class terrain_step(ManagerTermBase):
         self._patch_difficulty = torch.tensor(difficulty + [0.0], device=dev)
         self._forces = torch.zeros(n, f, 3, device=dev)
         self._rocks_placed = False
-        self._last_rock_reset = 0.0
+        self._last_recycle = 0.0
         self.rocks: RigidObjectCollection | None = env.scene.rigid_object_collections.get("rocks")
+        self._rock_sizes = torch.tensor([spec["size"] for spec in rock_specs], device=dev)
         self._write_foot_mu(torch.arange(n, device=dev))
 
     def _write_foot_mu(self, env_ids: torch.Tensor) -> None:
@@ -176,8 +175,8 @@ class terrain_step(ManagerTermBase):
         self._forces[env_ids] = 0.0
         self._write_foot_mu(env_ids)
         if self.rocks is not None and not self._rocks_placed:
-            # rocks are placed once; episode resets leave them where the robots pushed them
-            self.return_rocks(torch.arange(self.num_envs, device=self.device), only_drifted=False)
+            # stones are placed around the robots once; afterwards the ones left behind follow their robot
+            self.recycle_rocks(force=True)
             self._rocks_placed = True
 
     def __call__(self, env: ManagerBasedEnv, env_ids, world, asset_cfg, sensor_cfg) -> None:
@@ -191,9 +190,9 @@ class terrain_step(ManagerTermBase):
             self._sand(self.map.lookup(pos[..., :2])[1], patch, surface, pos, vel)
         if self.rocks is not None:
             now = env.common_step_counter * env.step_dt
-            if now - self._last_rock_reset >= self.world.rocks.reset_interval:
-                self._last_rock_reset = now
-                self.return_rocks(torch.arange(self.num_envs, device=self.device), only_drifted=True)
+            if now - self._last_recycle >= self.world.rocks.recycle_interval:
+                self._last_recycle = now
+                self.recycle_rocks()
 
     # -- slip
 
@@ -276,23 +275,51 @@ class terrain_step(ManagerTermBase):
 
     # -- rocks
 
-    def return_rocks(self, env_ids: torch.Tensor, only_drifted: bool) -> int:
-        """Move rocks back to their tile's slots (all of them, or only those beyond ``drift_max``)."""
-        terrain = self._env.scene.terrain
-        slots = self.map.rock_slots[terrain.terrain_levels[env_ids], terrain.terrain_types[env_ids]]  # (E, K, 4)
-        k = slots.shape[1]
-        # rock meshes have their bottom at the body origin; drop them from 2 cm above the ground
-        target = torch.cat([slots[..., :2], (slots[..., 2] + 0.02)[..., None]], dim=-1)
-        yaw = slots[..., 3]
-        quat = torch.stack([torch.zeros_like(yaw), torch.zeros_like(yaw), torch.sin(yaw / 2), torch.cos(yaw / 2)], -1)
-        pose = torch.cat([target, quat], dim=-1)
-        current = self.rocks.data.body_link_pose_w.torch[env_ids, :k]
-        move = (current[..., :3] - target).norm(dim=-1) > self.world.rocks.drift_max if only_drifted else None
-        if move is not None:
-            pose = torch.where(move[..., None], pose, current)
-        velocity = self.rocks.data.body_com_vel_w.torch[env_ids, :k].clone()
-        velocity[move if move is not None else slice(None)] = 0.0
-        self.rocks.write_body_link_pose_to_sim_index(body_poses=pose, body_ids=list(range(k)), env_ids=env_ids)
+    def recycle_rocks(self, force: bool = False) -> int:
+        """Move every robot's stones left behind (farther than ``recycle_radius``, or all with ``force``) to free spots
+        ahead of it; returns the number moved.
+
+        Spots: ``candidates`` random points at ``ahead`` distance within ``sector`` of the walking direction (the
+        heading below 0.2 m/s); each stone takes the one with the most clearance to the robot's other stones (circle
+        bounds of half their length). A stone is dropped 1 cm above the highest of five ground samples under it, so
+        it settles onto the bumps.
+        """
+        cfg, dev = self.world.rocks, self.device
+        data = self.rocks.data
+        pose = data.body_link_pose_w.torch.clone()  # (N, K, 7)
+        base = self.robot.data.root_link_pos_w.torch[:, :2]
+        far = (pose[..., :2] - base[:, None]).norm(dim=-1) > cfg.recycle_radius
+        if force:
+            far[:] = True
+        if not far.any():
+            return 0
+        n, k = far.shape
+        vel = self.robot.data.root_lin_vel_w.torch[:, :2]
+        q = self.robot.data.root_link_quat_w.torch  # (x, y, z, w)
+        heading = torch.atan2(2 * (q[:, 3] * q[:, 2] + q[:, 0] * q[:, 1]), 1 - 2 * (q[:, 1] ** 2 + q[:, 2] ** 2))
+        direction = torch.where(vel.norm(dim=-1) > 0.2, torch.atan2(vel[:, 1], vel[:, 0]), heading)
+        xy = pose[..., :2]
+        rows = torch.arange(n, device=dev)
+        for j in range(k):
+            if not far[:, j].any():
+                continue
+            angle = direction[:, None] + cfg.sector * (2 * torch.rand(n, cfg.candidates, device=dev) - 1)
+            radius = cfg.ahead[0] + (cfg.ahead[1] - cfg.ahead[0]) * torch.rand(n, cfg.candidates, device=dev)
+            spots = base[:, None] + radius[..., None] * torch.stack([angle.cos(), angle.sin()], -1)  # (N, C, 2)
+            clear = (spots[:, :, None] - xy[:, None]).norm(dim=-1) - (self._rock_sizes[j] + self._rock_sizes) / 2
+            clear[..., j] = float("inf")
+            best = spots[rows, clear.min(-1).values.argmax(-1)]
+            xy[:, j] = torch.where(far[:, j, None], best, xy[:, j])
+        offsets = torch.tensor([[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]], device=dev) * 0.5
+        under = xy[:, :, None] + offsets * self._rock_sizes[:, None, None]  # (N, K, 5, 2)
+        z = self.map.height(under).max(-1).values + 0.01
+        yaw = 2 * torch.pi * torch.rand(n, k, device=dev)
+        new = torch.cat([xy, z[..., None], torch.zeros(n, k, 2, device=dev), torch.sin(yaw / 2)[..., None],
+                         torch.cos(yaw / 2)[..., None]], -1)  # fmt: skip
+        pose = torch.where(far[..., None], new, pose)
+        velocity = data.body_com_vel_w.torch.clone()
+        velocity[far] = 0.0
+        self.rocks.write_body_link_pose_to_sim_index(body_poses=pose, body_ids=list(range(k)), env_ids=rows)
         self.rocks.write_body_com_velocity_to_sim_index(body_velocities=velocity, body_ids=list(range(k)),
-                                                        env_ids=env_ids)  # fmt: skip
-        return int(move.sum()) if move is not None else k * len(env_ids)
+                                                        env_ids=rows)  # fmt: skip
+        return int(far.sum())

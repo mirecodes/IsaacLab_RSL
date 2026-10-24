@@ -35,8 +35,8 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 RESULTS: list[tuple[str, bool]] = []
-DEFAULT_TERRAIN = {"ground": "rough_slope", "sand": "sand_field", "collapse": "crust_collapse", "rocks": "loose_rocks",
-                   "slip": "slip_slope", "smoke": "gravel", "view": "gravel"}  # fmt: skip
+DEFAULT_TERRAIN = {"ground": "rough_slope", "sand": "sand_field", "collapse": "crust_collapse", "rocks": "gravel_field",
+                   "slip": "slip_slope", "smoke": "rough_field", "view": "rough_field"}  # fmt: skip
 EVENT = "terrain"
 
 
@@ -84,7 +84,7 @@ def world(args, **overrides):
         path, value = item.split("=", 1)
         *parents, leaf = path.split(".")
         target = cfg
-        for name in parents:  # e.g. terrains.mesa_drop.scree_prob
+        for name in parents:  # e.g. terrains.rough_slope.slope_deg
             target = target[name] if isinstance(target, dict) else getattr(target, name)
         setattr(target, leaf, ast.literal_eval(value))
     if args.mesh:
@@ -341,13 +341,14 @@ def probe_collapse(args, args_cli):
 
 
 def probe_rocks(args, args_cli):
-    """T6: dynamic rocks settle without penetration, and only drifted rocks return to their slots."""
+    """T6: the stones settle on the ground without sinking, and only the stones left behind a robot follow it."""
     cfg = world(args, num_levels=1, tiles_per_level=2, robots_per_tile=args.robots_per_tile or 4)
     env, _ = make_env(args_cli, cfg)
     env = env.unwrapped
     env.reset()
     tmap, rocks, term = env.scene.terrain.terrain_map, env.scene["rocks"], term_of(env)
     park_robots(env)
+    run(env, 2.0)  # the parked robots' stones are moved next to them
     data = rocks.data
     speeds = []
     for i in range(round(10.0 / env.step_dt)):
@@ -362,28 +363,33 @@ def probe_rocks(args, args_cli):
     pos = data.body_link_pos_w.torch
     sunk = (pos[..., 2] < tmap.height(pos[..., :2]) - 0.02).sum().item()
     total = pos.shape[0] * pos.shape[1]
-    # at rest = net speed over the last second; without sleeping a few resting rocks jitter in place at ~1 cm/s
+    # at rest = net speed over the last second; without sleeping a few resting stones jitter in place at ~1 cm/s
     net, moved = (pos - pos9).norm(dim=-1), (pos - pos5).norm(dim=-1).max() * 1000
-    check("T6", (net < 0.01).all().item(), f"all {total} rocks at rest after 10 s (net speed over the last 1 s: max "
-          f"{net.max():.4f} m/s; instantaneous: max {speed[-1].max():.4f} m/s, {int((speed[-1] >= 0.01).sum())} rocks "
+    check("T6", (net < 0.01).all().item(), f"all {total} stones at rest after 10 s (net speed over the last 1 s: max "
+          f"{net.max():.4f} m/s; instantaneous: max {speed[-1].max():.4f} m/s, {int((speed[-1] >= 0.01).sum())} stones "
           f">= 0.01 m/s; largest displacement over the last 5 s {moved:.1f} mm)")  # fmt: skip
-    check("T6", sunk == 0, f"{sunk} rocks below the terrain")
-    check("T6", rest >= 0.95, f"{rest * 100:.1f} % of rock-steps at rest after 5 s (no sleeping in MuJoCo-Warp)")
-    # return: push half of env 0's rocks 2 m away, nudge the rest by 0.3 m
-    k = pos.shape[1]
-    pose = data.body_link_pose_w.torch.clone()
-    pose[0, : k // 2, 0] += 2.0
-    pose[0, k // 2 :, 0] += 0.3
-    first = torch.tensor([0], device=env.device)
-    rocks.write_body_link_pose_to_sim_index(body_poses=pose[:1], body_ids=list(range(k)), env_ids=first)
-    moved = term.return_rocks(first, only_drifted=True)
-    after = data.body_link_pose_w.torch
-    terrain = env.scene.terrain
-    slots = tmap.rock_slots[terrain.terrain_levels[0], terrain.terrain_types[0]]
-    back = (after[0, : k // 2, :2] - slots[: k // 2, :2]).norm(dim=-1)
-    kept = (after[0, k // 2 :, :3] - pose[0, k // 2 :, :3]).norm(dim=-1)
-    check("T6", moved == k // 2 and back.max() < 1e-3 and kept.max() < 1e-4,
-          f"rock return moved {moved}/{k} rocks (the {k // 2} drifted ones)")  # fmt: skip
+    check("T6", sunk == 0, f"{sunk} stones below the terrain")
+    check("T6", rest >= 0.95, f"{rest * 100:.1f} % of stone-steps at rest after 5 s (no sleeping in MuJoCo-Warp)")
+    # recycle: move robot 0 by 10 m; only its stones follow, to the ring ahead of it
+    robot = env.scene["robot"]
+    target = robot.data.root_link_pos_w.torch.clone()
+    target[0, 1] += 10.0
+    place(robot, target)
+    run(env, env.step_dt)
+    before = data.body_link_pos_w.torch.clone()
+    count = term.recycle_rocks()
+    run(env, env.step_dt)
+    after = data.body_link_pos_w.torch
+    k = after.shape[1]
+    dist = (after[0, :, :2] - robot.data.root_link_pos_w.torch[0, :2]).norm(dim=-1)
+    gaps = (after[0, :, None, :2] - after[0, None, :, :2]).norm(dim=-1) - (term._rock_sizes[:, None] +
+                                                                           term._rock_sizes) / 2  # fmt: skip
+    gaps.fill_diagonal_(float("inf"))
+    still = (after[1:] - before[1:]).norm(dim=-1).max().item()
+    lo, hi = cfg.rocks.ahead
+    check("T6", count == k and lo - 0.1 <= dist.min() and dist.max() <= hi + 0.1 and still < 0.01,
+          f"recycle moved {count} stones (robot 0's {k}) to {dist.min():.2f}-{dist.max():.2f} m from it, smallest gap "
+          f"{gaps.min():.2f} m; the other robots' stones moved {still * 1000:.1f} mm")  # fmt: skip
     env.close()
 
 
@@ -447,7 +453,7 @@ def probe_slip(args, args_cli):
 
 
 def probe_smoke(args, args_cli):
-    """T4/T6: spawn, early falls, stability, flights, moving-rock contacts, collapses, and speed under the policy."""
+    """T4/T6: spawn, early falls, stability, moving-rock contacts, collapses, and speed under the policy."""
     cfg = world(args)
     env, agent_cfg = make_env(args_cli, cfg)
     wrapped, policy = load_policy(env, agent_cfg, args_cli)
@@ -466,8 +472,7 @@ def probe_smoke(args, args_cli):
     seconds = args.seconds or 300.0  # the spec's 5 min smoke run
     early_falls = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     left_falls, stumbles, left = (torch.zeros_like(early_falls) for _ in range(3))
-    flight = torch.zeros(env.num_envs, device=env.device)
-    flights, rock_contacts, nan_count, fast_count, falls = 0, 0, 0, 0, 0
+    rock_contacts, rock_rolls, nan_count, fast_count, falls = 0, 0, 0, 0, 0
     trigger = [i for i, n in enumerate(contact.body_names) if not n.endswith("_foot")]
     with torch.inference_mode():
         for step in range(round(seconds / env.step_dt)):
@@ -484,19 +489,17 @@ def probe_smoke(args, args_cli):
                 stumbles |= (contact.data.net_forces_w.torch[:, trigger].norm(dim=-1) > 1.0).any(-1) & ~fell
                 off = (pos[:, :2] - terrain.env_origins[:, :2]).abs().max(-1).values > cfg.platform_width / 2
                 left |= off & ~fell  # a fallen robot's position is already its reset position
-            # flights: all feet off the ground > 0.3 s, then a touchdown
             foot_force = contact.data.net_forces_w.torch[:, term.contact_foot_ids].norm(dim=-1)
-            air = (foot_force < 1.0).all(-1)
-            flights += int((~air & (flight > 0.3)).sum())
-            flight = torch.where(air, flight + env.step_dt, 0.0)
             if rocks is not None:
                 # a foot in contact within a moving dynamic rock's bounding radius (origin at the rock's bottom)
                 feet = robot.data.body_link_pos_w.torch[:, term.foot_ids]
                 center = rocks.data.body_link_pos_w.torch.clone()
-                center[..., 2] += rock_sizes / 4
+                center[..., 2] += rock_sizes / 8  # flat stones: about a quarter as high as long
                 touch = (feet[:, :, None] - center[:, None]).norm(dim=-1) < rock_sizes / 2 + 0.032 + 0.02
                 moving = rocks.data.body_com_lin_vel_w.torch.norm(dim=-1)[:, None] > 0.05
                 rock_contacts += int(((touch & moving).any(-1) & (foot_force > 1.0)).any(-1).sum())
+                # stones moving with no foot near them (sliding off a fold slope on their own)
+                rock_rolls += int((moving[:, 0] & ~touch.any(1)).sum())
             vel = robot.data.body_com_lin_vel_w.torch
             nan_count += int(torch.isnan(vel).any(-1).any(-1).sum())
             fast_count += int((vel.norm(dim=-1) > 20.0).any(-1).sum())
@@ -515,15 +518,15 @@ def probe_smoke(args, args_cli):
           f"{int(stumbles.sum())} touched the ground with a leg without falling; "
           f"{falls * per_minute:.1f} terminations per minute")  # fmt: skip
     print(f"[T4] {tag}: real-time factor {10.0 / bench:.2f} (10 s sim in {bench:.1f} s wall)")
-    # the spec's stability condition is for crust_collapse; tumbles down the 10 m slopes can exceed 20 m/s elsewhere
+    # the spec's stability condition is for crust_collapse; tumbles down the long inclines can exceed 20 m/s elsewhere
     stable = nan_count == 0 and (fast_count == 0 or args.terrain != "crust_collapse")
     check("T6", stable, f"{tag}: {nan_count} NaN states, {fast_count} robot-steps with a body faster than 20 m/s, "
           f"{term.num_collapses} collapses")  # fmt: skip
-    if args.terrain == "mesa_drop":
-        check("T6", flights * per_minute >= 1, f"{tag}: {flights * per_minute:.1f} flights and landings per minute")
     if rocks is not None:
         check("T6", rock_contacts * per_minute >= 1, f"{tag}: {rock_contacts * per_minute:.1f} moving-rock foot "
               "contacts per minute")  # fmt: skip
+        print(f"[T6] {tag}: {rock_rolls * env.step_dt / seconds / rock_sizes.numel() / env.num_envs * 100:.2f} % of "
+              "the time a dynamic rock moves with no foot near it")  # fmt: skip
     env.close()
 
 
@@ -570,7 +573,8 @@ def probe_view(args, args_cli):
     size, corner = tmap.size.cpu().numpy(), tmap.corner.cpu().numpy()
     extent = size * np.array([tmap.num_rows, tmap.num_cols])
     # the map spans 120 x 120 m by default: from far away it is a flat sheet, so look across it from two corners
-    near, far = np.array([*corner, 0.0]), np.array([*(corner + extent), 0.0])
+    z0, z1 = tmap.heights[0, 0].item(), tmap.heights[-1, -1].item()  # inclines rise along x
+    near, far = np.array([*corner, z0]), np.array([*(corner + extent), z1])
     for name, eye, target in (("overview_a", near, far), ("overview_b", far, near)):
         direction = np.sign(target - eye)
         shot(name, eye - 20.0 * direction + [0.0, 0.0, 30.0], eye + direction * [extent[0] / 2, extent[1] / 3, 0.0])

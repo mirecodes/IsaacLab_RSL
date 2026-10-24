@@ -5,9 +5,9 @@
 
 """Terrain templates: one module per terrain-generation algorithm.
 
-Adding a terrain type (``gravel.py`` is the smallest example):
+Adding a terrain type (``rough_field.py`` is the smallest example):
 
-1. Write ``<name>.py`` here: a ``@height_field_to_mesh`` function ``(difficulty, cfg) -> (height field, origin)``
+1. Write ``<name>.py`` here: a ``@height_field_template`` function ``(difficulty, cfg) -> (height field, origin)``
    built from :mod:`.common` (start with ``Grid``, end with ``finish``) and its cfg class deriving from
    :class:`~.common.TerrainTemplateCfg`.
 2. Add ``"<name>": <Name>Cfg()`` to :func:`~..world_cfg.default_terrains` and the name to ``TERRAINS`` in

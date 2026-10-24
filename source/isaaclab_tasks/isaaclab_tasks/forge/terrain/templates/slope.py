@@ -3,9 +3,14 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Rough slope: a pyramid (or bowl) with gravel noise and flat-topped rock ledges (climb and descent failures).
+"""Rough slope: a one-direction incline ``z = tan(theta) x``, plain or with fractal roughness (climb and descent
+failures).
 
-With ``zone="slip"`` and gentler knobs it is the ``slip_slope`` terrain (random foot slips).
+The incline runs along the map's x axis, the difficulty axis. Every tile of a row has the same base profile and the
+generator lifts each row onto the previous one's top edge, so the rows form one continuous hillside that steepens
+with difficulty. A flat landing strip across the tile center (``platform_width`` wide) holds the spawns; robots walk
+up (+x) or down (-x) from it, or along the contour (y). With ``zone="slip"`` and gentler knobs it is the
+``slip_slope`` terrain (random foot slips).
 """
 
 from __future__ import annotations
@@ -14,37 +19,45 @@ from collections.abc import Callable
 
 import numpy as np
 
-from isaaclab.terrains.height_field.utils import height_field_to_mesh
 from isaaclab.utils import configclass
 
-from .common import Grid, Range, TerrainTemplateCfg, finish, gravel, lerp, pyramid, upto
+from .common import Grid, Range, TerrainTemplateCfg, finish, height_field_template, lerp, rough, smoothstep
 
 
-@height_field_to_mesh
+def incline(grid: Grid, cfg: RoughSlopeCfg, slope: float) -> np.ndarray:
+    """Base profile ``b(x)`` [m] on the tile grid: gradient ``slope`` (rise over run) everywhere except the landing
+    ``|x| < platform_width / 2`` (where ``b = 0``), blended in over ``blend_width``."""
+    s = slope * smoothstep((np.abs(grid.x) - cfg.platform_width / 2) / cfg.blend_width)
+    b = np.concatenate([[0.0], np.cumsum((s[1:] + s[:-1]) / 2 * grid.hs)])
+    b -= b[np.argmin(np.abs(grid.x))]
+    return np.broadcast_to(b[:, None], grid.X.shape)
+
+
+def is_smooth(cfg: RoughSlopeCfg) -> bool:
+    return cfg.tile in cfg.smooth_tiles
+
+
+@height_field_template
 def slope_terrain(difficulty: float, cfg: RoughSlopeCfg) -> tuple[np.ndarray, np.ndarray]:
-    """Pyramid ``h = s min(fx, fy)`` to a flat top, gravel noise, and ledges raised above the local ground."""
+    """Incline of ``slope_deg``, plus the fractal roughness on the tiles not in ``smooth_tiles``."""
     g = Grid(cfg, difficulty)
-    h = pyramid(g, cfg, lerp(cfg.slope, difficulty), cfg.inverted) + gravel(g, cfg, difficulty)
-    ledges = []
-    for x, y in g.sample_xy(round(lerp(cfg.ledge_count, difficulty)), cfg, margin=1.0):
-        sx, sy = upto(g.rng, cfg.ledge_size, difficulty, 2) / 2
-        win = g.window(x, y, max(sx, sy))
-        inside = (np.abs(g.X[win] - x) < sx) & (np.abs(g.Y[win] - y) < sy)
-        top = g.height_at(h, np.array([[x, y]]))[0] + upto(g.rng, cfg.ledge_height, difficulty)
-        h[win] = np.where(inside, np.maximum(h[win], top), h[win])
-        ledges.append({"x": x, "y": y, "size": [2 * sx, 2 * sy], "top": top})
-    cfg.features = {"ledges": ledges}
-    return finish(g, h, cfg)
+    slope_deg = lerp(cfg.slope_deg, difficulty)
+    base = incline(g, cfg, np.tan(np.radians(slope_deg)))
+    h = base if is_smooth(cfg) else base + rough(g, cfg, difficulty)
+    cfg.features = {"slope_deg": slope_deg, "smooth": is_smooth(cfg)}
+    return finish(g, h, cfg, base)
 
 
 @configclass
 class RoughSlopeCfg(TerrainTemplateCfg):
     function: Callable = slope_terrain
-    slope: Range = (0.45, 1.0)
-    """Rise over run of every pyramid face."""
-    unit_size: Range = (0.2, 0.4)
-    amplitude: Range = (0.03, 0.10)
-    ledge_count: Range = (0.0, 8.0)
-    ledge_size: Range = (0.3, 0.8)
-    ledge_height: Range = (0.05, 0.20)
-    inverted: bool = False
+    difficulty_range: Range | None = (0.0, 1.0)
+    """The rows span the full ``slope_deg`` range: 0 deg at the first row, 45 deg at the last."""
+    slope_deg: Range = (0.0, 45.0)
+    """Incline angle [deg]."""
+    smooth_tiles: list = [0, 1]
+    """Tile columns with a plain incline; the other columns carry the fractal roughness below."""
+    unit_size: Range = (0.1, 0.25)
+    amplitude: Range = (0.02, 0.06)
+    fold_size: Range = (6.0, 4.0)
+    fold_amplitude: Range = (0.05, 0.25)

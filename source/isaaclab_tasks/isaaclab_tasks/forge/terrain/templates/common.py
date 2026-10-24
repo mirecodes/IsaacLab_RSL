@@ -6,11 +6,14 @@
 """What every terrain template shares: the base cfg, the tile grid, and reusable feature generators.
 
 A template is a function ``(difficulty, cfg) -> (int16 height field, origin)`` decorated with
-:func:`~isaaclab.terrains.height_field.utils.height_field_to_mesh`, plus a cfg class deriving from
-:class:`TerrainTemplateCfg` whose ``function`` is that template. Conventions (see ``REPORT.md``):
+:func:`height_field_template`, plus a cfg class deriving from :class:`TerrainTemplateCfg` whose ``function`` is that
+template. Conventions (see ``REPORT.md``):
 
 * Coordinates ``(X, Y)`` are relative to the tile center; the outer ``edge_width`` band is flat (``z = 0``) so that
   neighboring tiles meet without a step, and the central ``platform_width`` square is flat for spawning.
+* Exception, inclines (``slope.py``, ``stairs.py``): the edge band follows a base profile ``z = b(x)`` that is the
+  same for every tile of a row; the generator lifts each row so that its ``-x`` edge meets the previous row's ``+x``
+  edge, which chains the rows into one continuous hillside.
 * A ``(min, max)`` knob is interpolated by difficulty, ``lo + difficulty * (hi - lo)`` (:func:`lerp`); a scalar
   means ``(v, v)``. A per-instance size (a pit radius, a stub height, ...) is drawn from ``U(lo, lerp)`` (:func:`upto`),
   so the hardest tile spans the full range.
@@ -22,13 +25,15 @@ A template is a function ``(difficulty, cfg) -> (int16 height field, origin)`` d
 
 from __future__ import annotations
 
+import functools
 import zlib
 
 import numpy as np
 import scipy.interpolate as interpolate
+import trimesh
 
 from isaaclab.terrains.height_field.hf_terrains_cfg import HfTerrainBaseCfg
-from isaaclab.terrains.height_field.utils import to_discrete_units
+from isaaclab.terrains.height_field.utils import convert_height_field_to_mesh, to_discrete_units
 from isaaclab.utils import configclass
 
 ZONES = ("rigid", "slip", "sand")
@@ -69,14 +74,46 @@ class TerrainTemplateCfg(HfTerrainBaseCfg):
     blend_width: float = 1.0
     """Distance [m] over which features fade in from the edge band and the platform."""
 
+    difficulty_range: Range | None = None
+    """Difficulty of the first and the last row for this template; None uses the world's ``difficulty_range``."""
+
     unit_size: Range = (0.15, 0.5)
-    """Facet size [m] of the gravel noise."""
+    """Facet size [m] of the fine roughness (the smallest noise octave)."""
 
     amplitude: Range = (0.05, 0.18)
-    """Half range [m] of the gravel noise heights."""
+    """Half range [m] of the fine roughness heights."""
 
     interp_order: int = 1
-    """1: angular facets (linear interpolation); 3: smooth (cubic spline)."""
+    """Fine octave: 1 angular facets (linear interpolation), 3 smooth (cubic spline). Coarser octaves are smooth."""
+
+    fold_size: Range = (6.0, 4.0)
+    """Wavelength [m] of the largest noise octave (rolling ground, folds)."""
+
+    fold_amplitude: Range = (0.0, 0.0)
+    """Half range [m] of the largest octave; 0 leaves only the fine roughness."""
+
+    octaves: int = 4
+    """Noise octaves from ``fold_size`` down to ``unit_size``, sizes and amplitudes in geometric progression (fractal
+    noise, as in Minecraft-style terrain generators)."""
+
+
+def height_field_template(func):
+    """:func:`~isaaclab.terrains.height_field.utils.height_field_to_mesh` with a linearly extrapolated instead of a
+    zero one-pixel border, so a template whose edge band is not at zero (an incline) gets neither a trench nor a flat
+    ledge along its border. For every other template the two are identical."""
+
+    @functools.wraps(func)
+    def wrapper(difficulty: float, cfg: TerrainTemplateCfg):
+        hs, size = cfg.horizontal_scale, cfg.size
+        cfg.size = tuple((to_discrete_units(s, hs) - 1) * hs for s in size)
+        z, origin = func(difficulty, cfg)
+        cfg.size = size
+        heights = np.pad(z, 1, mode="reflect", reflect_type="odd")
+        vertices, triangles = convert_height_field_to_mesh(heights, hs, cfg.vertical_scale, cfg.slope_threshold)
+        origin[:2] += hs
+        return [trimesh.Trimesh(vertices=vertices, faces=triangles)], origin
+
+    return wrapper
 
 
 ##
@@ -164,10 +201,10 @@ class Grid:
         return h[i, j]
 
 
-def finish(grid: Grid, h: np.ndarray, cfg: TerrainTemplateCfg) -> tuple[np.ndarray, np.ndarray]:
-    """Clear the edge band and level the platform (features may reach into both), quantize, and return the spawn
-    origin on the platform center. Every template ends with it."""
-    h = np.where(grid.r <= 0.0, 0.0, h)
+def finish(grid: Grid, h: np.ndarray, cfg: TerrainTemplateCfg, base: np.ndarray | float = 0.0):
+    """Reset the edge band to ``base`` (0, or an incline's base profile) and level the platform (features may reach
+    into both), quantize, and return the spawn origin on the platform center. Every template ends with it."""
+    h = np.where(grid.r <= 0.0, base, h)
     h = np.where(grid.p <= 0.0, np.median(h[grid.p <= 0.0]), h)
     hf = np.rint(h / cfg.vertical_scale).astype(np.int16)
     # kept for the terrain map (the mesh merges duplicate vertices, so its vertex grid cannot be read back)
@@ -198,17 +235,25 @@ def noise(grid: Grid, unit_size: float, amplitude: float, order: int) -> np.ndar
     return spline(grid.x, grid.y)
 
 
-def gravel(grid: Grid, cfg: TerrainTemplateCfg, difficulty: float) -> np.ndarray:
-    """The template's gravel noise (``unit_size``, ``amplitude``, ``interp_order``), faded out at the edge band
-    and the platform."""
-    return grid.fade * noise(grid, lerp(cfg.unit_size, difficulty), lerp(cfg.amplitude, difficulty), cfg.interp_order)
+def rough(grid: Grid, cfg: TerrainTemplateCfg, difficulty: float) -> np.ndarray:
+    """The template's fractal roughness, faded out at the edge band and the platform.
 
-
-def pyramid(grid: Grid, cfg: TerrainTemplateCfg, slope: float, inverted: bool) -> np.ndarray:
-    """True pyramid ``slope * min(fx, fy)`` from the edge band to a flat top of ``platform_width``."""
-    top = slope * (grid.half.min() - cfg.edge_width - cfg.platform_width / 2)
-    h = np.minimum(slope * grid.r, top)
-    return -h if inverted else h
+    ``octaves`` value-noise layers from ``fold_size`` / ``fold_amplitude`` (rolling folds) down to ``unit_size`` /
+    ``amplitude`` (fine facets, ``interp_order``). Each layer fades in over half its wavelength (at least
+    ``blend_width``), so the folds rise gently from the flat edge band and platform instead of in a 1 m ramp.
+    """
+    unit, amp = lerp(cfg.unit_size, difficulty), lerp(cfg.amplitude, difficulty)
+    fold, fold_amp = lerp(cfg.fold_size, difficulty), lerp(cfg.fold_amplitude, difficulty)
+    if fold_amp <= 0.0 or cfg.octaves < 2:
+        return grid.fade * noise(grid, unit, amp, cfg.interp_order)
+    sizes = np.geomspace(fold, unit, cfg.octaves)
+    amps = np.geomspace(fold_amp, max(amp, 1e-4), cfg.octaves)
+    h = np.zeros_like(grid.X)
+    for i, (size, a) in enumerate(zip(sizes, amps)):
+        w = max(cfg.blend_width, size / 2)
+        fade = smoothstep(grid.r / w) * smoothstep(grid.p / w)
+        h += fade * noise(grid, size, a, cfg.interp_order if i == cfg.octaves - 1 else 3)
+    return h
 
 
 def add_pits(grid: Grid, h: np.ndarray, cfg, difficulty: float, density_scale: float = 1.0) -> list[dict]:

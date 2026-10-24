@@ -11,13 +11,12 @@ from collections.abc import Callable
 
 import numpy as np
 
-from isaaclab.terrains.height_field.utils import height_field_to_mesh
 from isaaclab.utils import configclass
 
-from .common import Grid, Range, TerrainTemplateCfg, add_stubs, finish, lerp, noise
+from .common import Grid, Range, TerrainTemplateCfg, add_stubs, finish, height_field_template, lerp, noise
 
 
-@height_field_to_mesh
+@height_field_template
 def stub_field_terrain(difficulty: float, cfg: StubFieldCfg) -> tuple[np.ndarray, np.ndarray]:
     """±1 cm smooth ground, spherical domes ``H sqrt(1 - (rho/r)^2)`` (r <= 5 cm) and half-cylinder roots."""
     g = Grid(cfg, difficulty)

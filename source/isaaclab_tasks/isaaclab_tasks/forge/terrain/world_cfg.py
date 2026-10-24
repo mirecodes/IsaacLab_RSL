@@ -18,10 +18,9 @@ from isaaclab.utils import configclass
 
 from .mdp.generator import TerrainGridGeneratorCfg
 from .templates.common import TerrainTemplateCfg
-from .templates.gravel import GravelCfg
-from .templates.loose_rocks import LooseRocksCfg
-from .templates.mesa import MesaDropCfg
-from .templates.mixed import MixedCfg
+from .templates.gravel_field import GravelFieldCfg, stone_shape
+from .templates.pit_field import PitFieldCfg
+from .templates.rough_field import RoughFieldCfg
 from .templates.sand import SandFieldCfg
 from .templates.slope import RoughSlopeCfg
 from .templates.stairs import RoughStairsCfg
@@ -37,24 +36,24 @@ A2_NOMINAL_FOOT_LOAD = 40.07 * 9.81 / 4
 def default_terrains() -> dict:
     """The terrain catalog: name -> template cfg. Keep the keys equal to ``TERRAINS`` in ``__init__.py``."""
     return {
-        # foot traps, trips, generic rough ground
-        "gravel": GravelCfg(),
+        # generic uneven ground: fine bumps on rolling folds
+        "rough_field": RoughFieldCfg(),
+        # foot traps, trips
+        "pit_field": PitFieldCfg(),
         # toe stubbing on bumps below the scanner resolution
         "stub_field": StubFieldCfg(),
-        # steep climb / descent failures
+        # climb / descent failures on a 0-45 deg incline, plain or rough
         "rough_slope": RoughSlopeCfg(),
-        # missed steps, edge catches
+        # missed steps, edge catches on 0-45 deg stairs, clean or uneven
         "rough_stairs": RoughStairsCfg(),
-        # random slips on a gentle slope
-        "slip_slope": RoughSlopeCfg(zone="slip", slope=(0.25, 0.6), amplitude=(0.0, 0.03), ledge_count=(0.0, 0.0)),
+        # random slips on a gentler incline (difficulty rows 0.4-1.0: 18-30 deg), fine roughness only
+        "slip_slope": RoughSlopeCfg(
+            zone="slip", difficulty_range=None, slope_deg=(10.0, 30.0), amplitude=(0.0, 0.03), fold_amplitude=(0.0, 0.0)
+        ),
         # sinking, lift-off failure, whole-body sinkage
         "sand_field": SandFieldCfg(),
-        # compound causes, feature densities halved
-        "mixed": MixedCfg(),
-        # falls from terraces, hard landings
-        "mesa_drop": MesaDropCfg(),
-        # support moving under the foot, ankle twists, body jamming
-        "loose_rocks": LooseRocksCfg(),
+        # support tilting under the foot (loose, mostly flat stones), kicked stones
+        "gravel_field": GravelFieldCfg(),
         # support lost right after touchdown (sand with collapsing crust patches)
         "crust_collapse": SandFieldCfg(crust_prob=0.4),
     }
@@ -117,33 +116,48 @@ class CollapseCfg:
 
 @configclass
 class RockCfg:
-    """Dynamic rocks of ``loose_rocks`` (static rocks are part of the terrain)."""
+    """The loose stones of ``gravel_field``: every stone is a dynamic body, and the stones follow their robot.
 
-    dynamic_rocks: int = 4
-    """Dynamic rocks per robot. MuJoCo-Warp simulates every robot in its own world, so each robot gets its own
-    copy of the dynamic rocks of its tile. The spec's ~1500 rocks (16 per robot) cut the real-time factor to 42 % of
-    the rock-free world; 4 keep 77-79 % (6: 71-73 %, at the spec's 70 % limit)."""
-    size: tuple[float, float] = (0.06, 0.25)
-    """Largest extent [m] of the dynamic rocks, power law with the template's exponent."""
+    MuJoCo-Warp simulates every robot in its own world, so a stone cannot be shared: each robot gets its own
+    ``dynamic_rocks`` stones, and the cost grows with stones per robot, not with the field's size. So instead of
+    strewing a whole tile, every ``recycle_interval`` the stones left farther than ``recycle_radius`` behind their
+    robot are moved to free spots ahead of it (``ahead``, within ``sector`` of its walking direction), where the robot
+    walks into them. The robust policy's foot scanners see only the global terrain, so a moved stone never pops
+    into its view.
+    """
+
+    dynamic_rocks: int = 12
+    """Stones per robot. 1500 rocks in total (16 per robot) cut the real-time factor to 42 % of the rock-free
+    world, 4 kept 77-79 %."""
+    size: tuple[float, float] = (0.10, 0.45)
+    """Length [m] of the stones: log-uniform and stratified, so the stones of a robot always run from kickable ones
+    to slabs it can stand on. Shapes (mostly flat) come from the ``gravel_field`` template's knobs."""
     density: tuple[float, float] = (2000.0, 3000.0)
-    """Density [kg/m^3], uniform per rock."""
-    friction: tuple[float, float] = (0.4, 0.9)
-    """Rock friction, uniform per rock."""
+    """Density [kg/m^3], uniform per stone."""
+    friction: tuple[float, float] = (0.8, 1.0)
+    """Stone friction, uniform per stone (it decides the stone-ground contact). High, so a stone stepped on near its
+    edge tilts and rocks on its support rather than sliding away."""
     torsional_friction: float = 0.02
     rolling_friction: float = 0.005
     """MuJoCo torsional [m] and rolling [m] friction of the rocks (``condim`` 6). Without sleeping, small resting
     rocks otherwise keep rocking at about 1-2 cm/s."""
-    reset_interval: float = 300.0
-    """Seconds between returns of drifted rocks to their slots."""
-    drift_max: float = 1.0
-    """Rocks farther than this [m] from their slot are returned."""
+    recycle_interval: float = 1.0
+    """Seconds between moves of the stones left behind."""
+    recycle_radius: float = 3.0
+    """Stones farther than this [m] from their robot's base (horizontally) are moved ahead."""
+    ahead: tuple[float, float] = (1.2, 3.0)
+    """Distance [m] from the base at which moved stones are placed (beyond the foot scanners' 0.5 m)."""
+    sector: float = 1.0
+    """Half angle [rad] around the walking direction (the heading when the robot stands) for moved stones."""
+    candidates: int = 8
+    """Random spots tried per moved stone; the one with the most clearance to the robot's other stones wins."""
 
 
 @configclass
 class TerrainWorldCfg:
     """One terrain map: ``num_levels`` difficulty rows x ``tiles_per_level`` tiles of the terrain type ``terrain``."""
 
-    terrain: str = "gravel"
+    terrain: str = "rough_field"
     """Terrain type: a key of :attr:`terrains`."""
     terrains: dict = default_terrains()
     """Name -> template cfg (edit a template's knobs here)."""
@@ -157,7 +171,7 @@ class TerrainWorldCfg:
     tiles_per_level: int = 5
     """Tiles per difficulty row; each has its own random layout."""
     difficulty_range: tuple[float, float] = (0.4, 1.0)
-    """Difficulty of the first and the last row."""
+    """Difficulty of the first and the last row (a template's own ``difficulty_range`` takes precedence)."""
     horizontal_scale: float = 0.03
     vertical_scale: float = 0.005
     border_width: float = 5.0
@@ -190,8 +204,6 @@ class TerrainWorldCfg:
         cfg = self.terrains[self.terrain]
         cfg.name = self.terrain
         cfg.platform_width = self.platform_width
-        if isinstance(cfg, LooseRocksCfg):
-            cfg.dynamic_sizes = [spec["size"] for spec in self.dynamic_rock_specs()]
         return cfg
 
     @property
@@ -200,10 +212,11 @@ class TerrainWorldCfg:
 
     @property
     def has_dynamic_rocks(self) -> bool:
-        return isinstance(self.terrains[self.terrain], LooseRocksCfg) and self.rocks.dynamic_rocks > 0
+        return isinstance(self.terrains[self.terrain], GravelFieldCfg) and self.rocks.dynamic_rocks > 0
 
     def terrain_generator(self) -> TerrainGridGeneratorCfg:
         """The generator: one row per difficulty, ``tiles_per_level`` columns of the selected template."""
+        template = self.template
         return TerrainGridGeneratorCfg(
             seed=self.seed,
             size=(self.tile_size, self.tile_size),
@@ -212,23 +225,25 @@ class TerrainWorldCfg:
             num_cols=self.tiles_per_level,
             horizontal_scale=self.horizontal_scale,
             vertical_scale=self.vertical_scale,
-            slope_threshold=0.75,
-            difficulty_range=self.difficulty_range,
+            # no vertical correction: the mesh vertices stay on the height-field grid, so the heightfield collider
+            # equals the template, and a 45 deg incline is not turned into one-pixel steps
+            slope_threshold=None,
+            difficulty_range=template.difficulty_range or self.difficulty_range,
             use_cache=False,
-            sub_terrains={self.terrain: self.template},
+            sub_terrains={self.terrain: template},
         )
 
     def dynamic_rock_specs(self) -> list[dict]:
-        """Shape and material of each dynamic rock, shared by all environments and tiles."""
+        """Shape and material of each stone, shared by all environments."""
         rng = np.random.default_rng([self.seed, 9])
-        template = LooseRocksCfg()
-        lo, hi, a = self.rocks.size[0], self.rocks.size[1], template.size_exponent + 1.0
+        template = self.terrains[self.terrain] if self.has_dynamic_rocks else GravelFieldCfg()
+        lo, hi, k = self.rocks.size[0], self.rocks.size[1], self.rocks.dynamic_rocks
         specs = []
-        for i in range(self.rocks.dynamic_rocks):
+        for i in range(k):
             specs.append({
                 "template": i % template.template_count,
-                "size": float((lo**a + rng.uniform() * (hi**a - lo**a)) ** (1.0 / a)),
-                "axis_ratio": rng.uniform(*template.axis_ratio, 2).tolist(),
+                "size": float(lo * (hi / lo) ** ((i + rng.uniform()) / k)),
+                "axis_ratio": stone_shape(rng, template),
                 "density": float(rng.uniform(*self.rocks.density)),
                 "friction": float(rng.uniform(*self.rocks.friction)),
             })  # fmt: skip

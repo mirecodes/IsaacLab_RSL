@@ -7,9 +7,9 @@
 
 Runs on any machine with Isaac Lab installed (no GPU, no Kit), e.g. in the local container::
 
-    python scripts/reinforcement_learning/terrain/build.py gravel            # one terrain type
+    python scripts/reinforcement_learning/terrain/build.py rough_slope       # one terrain type
     python scripts/reinforcement_learning/terrain/build.py all --seed 3      # every terrain type
-    python scripts/reinforcement_learning/terrain/build.py --plot logs/terrain/gravel_seed42.yaml   # redraw
+    python scripts/reinforcement_learning/terrain/build.py --plot logs/terrain/rough_slope_seed42.yaml   # redraw
 
 ``--plot`` only redraws an existing description (e.g. one written by the importer during a run).
 """
@@ -23,7 +23,7 @@ import yaml
 
 
 def plot_map(meta: dict, path: str, heights: np.ndarray | None = None) -> None:
-    """Top-down map: tile borders, difficulties, sand patches, and rocks (red: dynamic slots)."""
+    """Top-down map: tile borders, difficulties, and sand patches."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -49,9 +49,6 @@ def plot_map(meta: dict, path: str, heights: np.ndarray | None = None) -> None:
         w, h = p["size"]
         ax.add_patch(mpatches.Rectangle((p["y"] - h / 2, p["x"] - w / 2), h, w, ec="saddlebrown" if p["crust"] else
                                         "orange", fc="none", lw=0.8))  # fmt: skip
-    if meta["rocks"]:
-        r = np.array([[q["y"], q["x"], q["size"], q["dynamic"]] for q in meta["rocks"]])
-        ax.scatter(r[:, 0], r[:, 1], s=(r[:, 2] * 40) ** 2, c=np.where(r[:, 3] > 0, "red", "k"), lw=0)
     ax.set_xlim(y0, y0 + cols * sy)
     ax.set_ylim(x0, x0 + rows * sx)
     ax.set_aspect("equal")

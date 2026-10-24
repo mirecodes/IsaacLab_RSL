@@ -5,9 +5,9 @@
 
 """Terrain grid generator and importer: one template, one tile per (difficulty row, column), plus the terrain map.
 
-* :class:`TerrainGridGenerator` generates the tiles with a fixed difficulty per row and records what each tile holds
-  (difficulty, sand patches, rocks) and the full height field.
-* :class:`TerrainGridImporter` imports the terrain, spawns the sand slabs and static rocks as global colliders,
+* :class:`TerrainGridGenerator` generates the tiles with a fixed difficulty per row, chains the rows of an incline,
+  and records what each tile holds (difficulty, sand patches) and the full height field.
+* :class:`TerrainGridImporter` imports the terrain, spawns the sand slabs as global colliders,
   spreads the robots evenly over the tiles, builds the :class:`TerrainMap`, and writes the map description.
 * :class:`TerrainMap` turns world positions into tiles, difficulties, sand patches, and terrain heights on the GPU.
 """
@@ -31,7 +31,6 @@ from isaaclab.terrains import TerrainGenerator, TerrainGeneratorCfg, TerrainImpo
 from isaaclab.utils import clone, configclass
 
 from ..templates.common import ZONES
-from ..templates.loose_rocks import rock_mesh
 
 if TYPE_CHECKING:
     from ..templates.common import TerrainTemplateCfg
@@ -40,7 +39,6 @@ logger = logging.getLogger(__name__)
 
 SAND_COLOR = (0.85, 0.72, 0.45)
 CRUST_COLOR = (0.62, 0.52, 0.38)
-ROCK_COLOR = (0.45, 0.43, 0.40)
 SLAB_DEPTH = 0.6
 """Height [m] of the sand-slab boxes, from the sand surface down (sand is at most a few decimeters deep)."""
 
@@ -56,6 +54,9 @@ class TerrainGridGenerator(TerrainGenerator):
     Every column uses the single template of :attr:`TerrainGeneratorCfg.sub_terrains` (a tile index seeds each
     column differently), and the difficulty of row ``i`` is ``lower + (upper - lower) * i / (num_rows - 1)`` without
     Isaac Lab's random offset, so a tile's difficulty is exactly its row's.
+
+    Rows are lifted so that each row's ``-x`` edge meets the previous row's ``+x`` edge (all zero, i.e. no lift,
+    except for inclines), and the outer border continues the map's edge heights outward.
     """
 
     last: TerrainGridGenerator | None = None
@@ -68,12 +69,15 @@ class TerrainGridGenerator(TerrainGenerator):
             raise ValueError(f"A terrain grid holds one template, got {list(cfg.sub_terrains)}.")
         self.tiles: list[list[dict]] = [[{} for _ in range(cfg.num_cols)] for _ in range(cfg.num_rows)]
         self.tile_heights: dict[tuple[int, int], np.ndarray] = {}
+        self.row_lift = np.zeros(cfg.num_rows)
+        """Height [m] each row is lifted by to meet the previous row."""
         super().__init__(cfg, device)
         TerrainGridGenerator.last = self
 
     def _generate_curriculum_terrains(self):
         sub_cfg = next(iter(self.cfg.sub_terrains.values()))
         lower, upper = self.cfg.difficulty_range
+        # column 0 goes first, row by row, and fixes each row's lift; the other columns share the row's edge profile
         for col in range(self.cfg.num_cols):
             for row in range(self.cfg.num_rows):
                 difficulty = lower + (upper - lower) * row / max(self.cfg.num_rows - 1, 1)
@@ -91,19 +95,48 @@ class TerrainGridGenerator(TerrainGenerator):
         cfg.tile = col
         meshes, origin = cfg.function(difficulty, cfg)
         mesh = trimesh.util.concatenate(meshes)
-        # the height field of the mesh: the template's heights inside the one-pixel zero border of the decorator
-        self.tile_heights[self._tile] = np.pad(cfg.heights, 1)
+        # the height field of the mesh: the template's heights inside the decorator's extrapolated border
+        heights = np.pad(cfg.heights, 1, mode="reflect", reflect_type="odd")
+        if col == 0 and row > 0:
+            previous = self.tile_heights[(row - 1, 0)]
+            self.row_lift[row] = previous[-1].mean() - heights[0].mean()
+        self.tile_heights[self._tile] = heights + self.row_lift[row]
         transform = np.eye(4)
-        transform[0:2, -1] = -cfg.size[0] * 0.5, -cfg.size[1] * 0.5
+        transform[0:3, -1] = -cfg.size[0] * 0.5, -cfg.size[1] * 0.5, self.row_lift[row]
         mesh.apply_transform(transform)
         origin += transform[0:3, -1]
         self.tiles[row][col] = {"difficulty": float(difficulty), "features": getattr(cfg, "features", {})}
         return mesh, origin
 
+    def _add_terrain_border(self):
+        """A flat apron of ``border_width`` around the grid that continues each edge pixel's height outward (Isaac
+        Lab's border sits at z = 0, a cliff next to a raised incline row)."""
+        heights, _ = self.map_heights()
+        hs, w = self.cfg.horizontal_scale, self.cfg.border_width
+        x = np.arange(heights.shape[0]) * hs
+        y = np.arange(heights.shape[1]) * hs
+        # the two x edges also cover the corners
+        y_long = np.concatenate([[-w], y, [y[-1] + w]])
+        edges = [  # (points along the edge, outward offset)
+            (np.stack([np.zeros_like(y_long), y_long, np.pad(heights[0], 1, mode="edge")], 1), (-w, 0.0)),
+            (np.stack([np.full_like(y_long, x[-1]), y_long, np.pad(heights[-1], 1, mode="edge")], 1), (w, 0.0)),
+            (np.stack([x, np.zeros_like(x), heights[:, 0]], 1), (0.0, -w)),
+            (np.stack([x, np.full_like(x, y[-1]), heights[:, -1]], 1), (0.0, w)),
+        ]
+        for line, (dx, dy) in edges:
+            n = len(line)
+            vertices = np.vstack([line, line + [dx, dy, 0.0]])
+            i = np.arange(n - 1)
+            faces = np.concatenate([np.stack([i, i + 1, n + i + 1], 1), np.stack([i, n + i + 1, n + i], 1)])
+            apron = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+            down = apron.face_normals[:, 2] < 0
+            faces[down] = faces[down][:, ::-1]
+            self.terrain_meshes.append(trimesh.Trimesh(vertices=vertices, faces=faces, process=False))
+
     def map_heights(self) -> tuple[np.ndarray, np.ndarray]:
         """Terrain height [m] on the pixel grid of the whole tile grid, and its lower corner ``(x, y)`` [m].
 
-        Tiles share their border pixel. Heights outside the tile grid (the outer border) are zero.
+        Tiles share their border pixel. The array covers the tile grid only (not the border).
         """
         (n, m), rows, cols = next(iter(self.tile_heights.values())).shape, self.cfg.num_rows, self.cfg.num_cols
         heights = np.zeros((rows * (n - 1) + 1, cols * (m - 1) + 1), dtype=np.float32)
@@ -130,7 +163,7 @@ def map_meta(generator: TerrainGridGenerator, settings: dict) -> dict:
     from isaaclab import __version__ as isaaclab_version
 
     name, template = next(iter(generator.cfg.sub_terrains.items()))
-    tiles, patches, rocks = [], [], []
+    tiles, patches = [], []
     for row in range(generator.cfg.num_rows):
         for col in range(generator.cfg.num_cols):
             tile = generator.tiles[row][col]
@@ -138,15 +171,12 @@ def map_meta(generator: TerrainGridGenerator, settings: dict) -> dict:
             feats = tile["features"]
             tiles.append({
                 "row": row, "col": col, "difficulty": tile["difficulty"], "origin": [ox, oy, oz],
-                "features": {k: v for k, v in feats.items() if k not in ("patches", "rocks", "pits", "stubs",
-                                                                       "trenches", "ledges")},
+                "features": {k: v for k, v in feats.items() if k not in ("patches", "pits", "stubs", "trenches")},
                 "num_pits": len(feats.get("pits", [])), "num_stubs": len(feats.get("stubs", [])),
             })  # fmt: skip
             for i, p in enumerate(feats.get("patches", [])):
                 patches.append({"id": len(patches), "row": row, "col": col, "index": i, **p,
                                 "x": ox + p["x"], "y": oy + p["y"]})  # fmt: skip
-            for r in feats.get("rocks", []):
-                rocks.append({"row": row, "col": col, **r, "x": ox + r["x"], "y": oy + r["y"]})
     return _plain({
         "isaaclab_version": isaaclab_version,
         "terrain": name,
@@ -158,7 +188,6 @@ def map_meta(generator: TerrainGridGenerator, settings: dict) -> dict:
         "corner": (-0.5 * np.array([generator.cfg.num_rows, generator.cfg.num_cols]) * generator.cfg.size).tolist(),
         "tiles": tiles,
         "sand_patches": patches,
-        "rocks": rocks,
         "settings": settings,
     })  # fmt: skip
 
@@ -216,13 +245,6 @@ class TerrainMap:
             self.patch_table[p["row"], p["col"], k] = torch.tensor([p["x"], p["y"], *half, p["surface"], p["id"]])
             count[p["row"], p["col"]] += 1
         self.patch_surface = torch.tensor([p["surface"] for p in self.patches] + [0.0], device=device)
-        # dynamic rock slots of each tile: (x, y, ground, yaw)
-        slots = [[[[r["x"], r["y"], r["ground"], r["yaw"]] for r in meta["rocks"]
-                   if r["dynamic"] and (r["row"], r["col"]) == (row, col)] for col in range(self.num_cols)]
-                 for row in range(self.num_rows)]  # fmt: skip
-        k = min(len(s) for row in slots for s in row)
-        self.rock_slots = torch.tensor([[s[:k] for s in row] for row in slots], device=device)
-        self.rock_slots = self.rock_slots.reshape(self.num_rows, self.num_cols, k, 4)
         # terrain heights
         self.heights = torch.from_numpy(heights).to(device)
         self.heights_corner = torch.tensor(corner, device=device, dtype=torch.float32)
@@ -266,7 +288,7 @@ class TerrainMap:
 
 
 class TerrainGridImporter(TerrainImporter):
-    """Terrain importer of a terrain grid: sand slabs, static rocks, even robot spread, terrain map, description."""
+    """Terrain importer of a terrain grid: sand slabs, even robot spread, terrain map, description."""
 
     cfg: TerrainGridImporterCfg
 
@@ -277,7 +299,6 @@ class TerrainGridImporter(TerrainImporter):
         heights, corner = generator.map_heights()
         self.terrain_map = TerrainMap(self.meta, heights, corner, generator.cfg.horizontal_scale, self.device)
         self._spawn_sand()
-        self._spawn_static_rocks()
         if cfg.meta_path:
             self.meta_path = os.path.abspath(cfg.meta_path.format(terrain=self.meta["terrain"], seed=self.meta["seed"]))
             write_meta(self.meta_path, self.meta)
@@ -315,32 +336,6 @@ class TerrainGridImporter(TerrainImporter):
 
     def patch_path(self, patch: dict) -> str:
         return f"{self.cfg.prim_path}/sand/tile_{patch['row']}_{patch['col']}/patch_{patch['index']}"
-
-    def _spawn_static_rocks(self) -> None:
-        """One static convex collider per rock (buried ones flattened to half height).
-
-        Convex, not one merged triangle mesh per tile: Newton finds no contacts between the dynamic rocks' convex
-        hulls and a triangle mesh (the dynamic rocks fell through the mesh terrain), but does between convex shapes.
-        """
-        seed = self.meta["seed"] or 0
-        material = f"{self.cfg.prim_path}/rocks/material"
-        if any(not r["dynamic"] for r in self.meta["rocks"]):
-            look = sim_utils.PreviewSurfaceCfg(diffuse_color=ROCK_COLOR)
-            look.func(material, look)
-        count: dict[tuple[int, int], int] = {}
-        for r in self.meta["rocks"]:
-            if r["dynamic"]:
-                continue
-            mesh = rock_mesh(seed, r["template"], r["size"], r["axis_ratio"], r["yaw"], 0.5 if r["buried"] else 1.0)
-            i = count[(r["row"], r["col"])] = count.get((r["row"], r["col"]), -1) + 1
-            spawn = sim_utils.MeshFileCfg(
-                mesh=sim_utils.MeshFileCfg.TrimeshObjectCfg(mesh=mesh),
-                collision_props=[sim_utils.UsdPhysicsCollisionCfg(collision_enabled=True)],
-                mesh_collision_props=[sim_utils.UsdPhysicsMeshCollisionCfg(mesh_approximation_name="convexHull")],
-            )
-            path = f"{self.cfg.prim_path}/rocks/tile_{r['row']}_{r['col']}/rock_{i}"
-            spawn.func(path, spawn, translation=(r["x"], r["y"], r["ground"] - 0.01))
-            sim_utils.bind_visual_material(path, material)
 
 
 @configclass

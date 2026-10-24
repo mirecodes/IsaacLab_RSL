@@ -12,15 +12,14 @@ the trained tasks' own, so their checkpoints load unchanged. See ``REPORT.md`` a
 import gymnasium as gym
 
 TERRAINS = (
-    "gravel",
+    "rough_field",
+    "pit_field",
     "stub_field",
     "rough_slope",
     "rough_stairs",
     "slip_slope",
     "sand_field",
-    "mixed",
-    "mesa_drop",
-    "loose_rocks",
+    "gravel_field",
     "crust_collapse",
 )
 """Terrain types: the keys of ``world_cfg.default_terrains``, listed here so that registration imports nothing."""
@@ -30,7 +29,7 @@ RUNNERS = {"A2Robust": "A2RobustTeacherPPORunnerCfg", "A2Energy": "A2EnergyTeach
 
 
 def task_id(terrain: str, policy: str) -> str:
-    """``gravel``, ``A2Robust`` -> ``IsaacContrib-Terrain-Gravel-A2Robust``."""
+    """``rough_field``, ``A2Robust`` -> ``IsaacContrib-Terrain-RoughField-A2Robust``."""
     return f"IsaacContrib-Terrain-{terrain.title().replace('_', '')}-{policy}"
 
 

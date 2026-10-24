@@ -1,7 +1,7 @@
 # Terrain templates
 
-**Gym IDs:** `IsaacContrib-Terrain-<Type>-A2{Robust,Energy}`, `<Type>` ∈ `Gravel`, `StubField`, `RoughSlope`,
-`RoughStairs`, `SlipSlope`, `SandField`, `Mixed`, `MesaDrop`, `LooseRocks`, `CrustCollapse` (20 tasks)
+**Gym IDs:** `IsaacContrib-Terrain-<Type>-A2{Robust,Energy}`, `<Type>` ∈ `RoughField`, `PitField`, `StubField`,
+`RoughSlope`, `RoughStairs`, `SlipSlope`, `SandField`, `GravelField`, `CrustCollapse` (18 tasks)
 **Base:** `A2RobustTeacherEnvCfg`, `A2EnergyTeacherRoughEnvCfg` (`velocity/a2_velocity`), with their runner cfgs ·
 **Copied from:** `a2_velocity/mdp/events.py:randomize_foot_friction` (the Newton friction binding) ·
 **Sources:** "Harsh World 구현 명세서 — fault 관측용 지형" (2026-10-24)
@@ -26,8 +26,8 @@ flowchart LR
         tpl --> gen[TerrainGridGenerator<br/>row = difficulty, column = tile]
         gen --> imp[TerrainGridImporter]
         imp --> hf[(terrain heightfield)]
-        imp --> slabs[(sand slabs, static rocks<br/>global colliders)]
-        imp --> tmap[TerrainMap<br/>tiles, patches, heights, rock slots]
+        imp --> slabs[(sand slabs<br/>global colliders)]
+        imp --> tmap[TerrainMap<br/>tiles, patches, heights]
         imp --> meta[map description yaml]
     end
     subgraph step[Every policy step, 50 Hz]
@@ -36,14 +36,14 @@ flowchart LR
         ev -->|foot friction: slip| sim
         ev -->|drag wrench: sand| sim
         ev -->|slab stiffness: crust| sim
-        ev -->|rock return: rocks| sim
+        ev -->|stones follow their robot| sim
     end
 ```
 
 | Module | Rate | What it does |
 | --- | --- | --- |
 | Policy, actuators | unchanged | the trained task's (CPG teacher or energy policy) |
-| `terrain` event (`mdp/events.py:terrain_step`, interval 0 s) | 50 Hz | only what the type needs: slip friction, sand drag, crust collapse, rock return |
+| `terrain` event (`mdp/events.py:terrain_step`, interval 0 s) | 50 Hz | only what the type needs: slip friction, sand drag, crust collapse, stone recycling (1 Hz) |
 
 Networks: the trained tasks' (unchanged).
 
@@ -51,10 +51,10 @@ Networks: the trained tasks' (unchanged).
 
 | Path | Content |
 | --- | --- |
-| `templates/common.py` | `TerrainTemplateCfg` (shared knobs), `Grid` (tile pixels, masks, seeded RNG), `finish`, shared feature generators (noise, pyramid, pits, trenches, stubs) |
-| `templates/<type>.py` | one terrain-generation algorithm and its cfg (`gravel`, `stub_field`, `slope`, `stairs`, `sand`, `mixed`, `mesa`, `loose_rocks`) |
+| `templates/common.py` | `TerrainTemplateCfg` (shared knobs), `height_field_template` (decorator), `Grid` (tile pixels, masks, seeded RNG), `finish`, shared feature generators (noise, fractal `rough`, pits, trenches, stubs) |
+| `templates/<type>.py` | one terrain-generation algorithm and its cfg (`rough_field`, `pit_field`, `stub_field`, `slope`, `stairs`, `sand`, `gravel_field`) |
 | `world_cfg.py` | `default_terrains()` (the catalog: name → template cfg), `TerrainWorldCfg` (grid, spawn, commands) and the physics cfgs (slip, sand, collapse, rocks) |
-| `mdp/generator.py` | grid generator, importer (slabs, rocks, robot spread), `TerrainMap`, map description |
+| `mdp/generator.py` | grid generator, importer (slabs, robot spread), `TerrainMap`, map description |
 | `mdp/events.py` | the runtime physics event |
 | `env_cfg.py` | `apply_terrain`: a trained task's env cfg → a terrain map; one env cfg per policy |
 | `__init__.py` | `TERRAINS` and the gym registration of every (type, policy) |
@@ -64,18 +64,21 @@ Networks: the trained tasks' (unchanged).
 
 ### 3.1 Template contract
 
-A template is `f(d, cfg) → (h, origin)`, decorated with Isaac Lab's `height_field_to_mesh`: `h` is an `int16`
-height field in units of `vertical_scale` on the tile's pixel grid, `origin` the spawn point. Every template
+A template is `f(d, cfg) → (h, origin)`, decorated with `height_field_template` (Isaac Lab's
+`height_field_to_mesh` with a linearly extrapolated instead of a zero one-pixel border): `h` is an `int16` height
+field in units of `vertical_scale` on the tile's pixel grid, `origin` the spawn point. Every template
 
-* starts with `Grid(cfg, d)` and ends with `finish(grid, h, cfg)`, which zeroes the outer `edge_width` = 1 m band
-  (tiles meet without a step), levels the central `platform_width` = 3 m square to its median (spawn), quantizes,
-  and keeps the heights for the terrain map;
+* starts with `Grid(cfg, d)` and ends with `finish(grid, h, cfg, base)`, which resets the outer `edge_width` = 1 m
+  band to `base` (tiles meet without a step), levels the central `platform_width` = 3 m square to its median
+  (spawn), quantizes, and keeps the heights for the terrain map. `base` is 0, except for the inclines (`slope.py`,
+  `stairs.py`), whose base profile `b(x)` is the same on every tile of a row; the generator lifts each row so that
+  its `-x` edge meets the previous row's `+x` edge;
 * fades features in over `blend_width` = 1 m from both (`grid.fade`);
 * reads a knob `(lo, hi)` as `lerp = lo + d (hi - lo)` for densities, counts and amplitudes, and draws per-instance
   sizes from `U(lo, lerp)` (`upto`);
 * draws randomness only from `grid.rng`, seeded by `(seed, crc32(name), round(10⁶ d), tile)`: a tile does not depend
   on the generation order, the tiles of a row differ, and a seed reproduces the map exactly;
-* writes what the importer or the tests need to `cfg.features` (sand `patches`, `rocks`, `pits`, ...), in meters
+* writes what the importer or the tests need to `cfg.features` (sand `patches`, `pits`, ...), in meters
   relative to the tile center.
 
 Adding a type: a module in `templates/`, an entry in `default_terrains()`, its name in `TERRAINS`
@@ -85,6 +88,9 @@ Adding a type: a module in `templates/`, an entry in `default_terrains()`, its n
 
 Tiles are `tile_size` = 24 m squares on a 5 x 5 grid (120 x 120 m): row `i` has difficulty
 `d_i = 0.4 + 0.6 i / (num_levels - 1)` (0.4, 0.55, 0.7, 0.85, 1.0), and each row holds `tiles_per_level` = 5 tiles.
+A template may set its own `difficulty_range`: the inclines use (0, 1), so their rows are 0, 11.25, 22.5, 33.75 and
+45 deg. Rows run along x, so an incline map is one hillside rising along x (55 m in total for `rough_slope`). The
+outer border (5 m) continues the height of each edge pixel outward instead of sitting at z = 0.
 `num_envs = 5 x 5 x 4 = 100`; the robots of a column cycle through the rows, so each tile gets 4. Resets return a robot to its own tile's platform (offset `U(±0.57 m)²`, yaw
 `U(±π)`, at rest, base 0.45 m above it). Episode 60 s.
 
@@ -92,32 +98,32 @@ Tiles are `tile_size` = 24 m squares on a 5 x 5 grid (120 x 120 m): row `i` has 
 
 | Type | Template | Zone | Geometry |
 | --- | --- | --- | --- |
-| `gravel` | `gravel.py` | rigid | uniform heights on a grid of `unit_size`, linearly interpolated (facets), conical pits (`h -= depth (1 - ρ/r)`, raised rim), V-trenches |
+| `rough_field` | `rough_field.py` | rigid | fractal value noise: `octaves` = 4 layers from rolling folds (`fold_size` 8→4 m, ±0.1–0.4 m) down to fine bumps (`unit_size` 0.1–0.2 m, ±2–5 cm, facets), sizes and amplitudes in geometric progression; each layer fades in over half its wavelength from the edge band and platform |
+| `pit_field` | `pit_field.py` | rigid | uniform heights on a grid of `unit_size`, linearly interpolated (facets), conical pits (`h -= depth (1 - ρ/r)`, raised rim), V-trenches |
 | `stub_field` | `stub_field.py` | rigid | ±1 cm ground, spherical domes `h += H sqrt(1 - (ρ/r)²)` (r ≤ 5 cm), half-cylinder roots |
-| `rough_slope` | `slope.py` | rigid | pyramid `h = s min(fx, fy)` to a flat top, gravel noise, flat-topped ledges |
-| `rough_stairs` | `stairs.py` | rigid | pyramid stairs, step widths `w U(0.7, 1.3)`, step edges eroded by a smooth field of amplitude `edge_jitter`, noise |
-| `slip_slope` | `slope.py` | slip | `rough_slope` with `s` 0.25–0.6, noise ≤ 3 cm, no ledges |
-| `sand_field` | `sand.py` | sand | gravel hardpan; patches (foot/pair/body, 3:2:2) flattened to their mean level `s` around the slab footprint, interior lowered by `sand_depth` keeping half the roughness, 0.1 m ramp |
-| `mixed` | `mixed.py` | rigid | gentle pyramid + gravel + stubs + pits + trenches, densities halved |
-| `mesa_drop` | `mesa.py` | rigid | mesa of `mesa_height` (3–4 m), terraces of `drop = mesa_height / ceil(mesa_height / drop_height)` (1.5–2 m) and `tread_width` (4 m); each side a cliff, a 45° scree ramp (p 0.2) or rubble (p 0.1) |
-| `loose_rocks` | `loose_rocks.py` | rigid | gentle gravel; static rocks (power-law sizes, 30 % flattened "buried"), a dense quadrant spaced `0.8–1.5 x` body width, dynamic rocks on a ring around the platform |
+| `rough_slope` | `slope.py` | rigid | one-direction incline `b(x)` of `slope_deg` 0–45 deg along x through a 3 m flat landing (spawn), blended over 1 m; columns in `smooth_tiles` (0, 1) plain, the others with the fractal roughness (folds ±5–25 cm) |
+| `rough_stairs` | `stairs.py` | rigid | one-direction stairs at `slope_deg` 0–45 deg: tread `step_width` 0.35→0.25 m, riser `tread x tan θ` (0.25 m at 45 deg), up along +x and down along -x from the landing; rough columns: treads `U(0.8, 1.2)` (rescaled to the clean flight's length), step edges eroded (`edge_jitter` ≤ 8 cm), ≤ 3 cm noise |
+| `slip_slope` | `slope.py` | slip | incline of 18–30 deg (d 0.4–1.0), fine noise ≤ 3 cm on the rough columns, no folds |
+| `sand_field` | `sand.py` | sand | rough hardpan; patchwork of patches: the tile is cut into an irregular grid (cells 1.2–4.5 m per column and row), 25–45 % of the cells hold a rectangle inset by 0.4 + U(0, 0.6) m per side; each patch flattened to its mean level `s` around the slab footprint, interior lowered by `sand_depth` keeping half the roughness, 0.1 m ramp |
+| `gravel_field` | `gravel_field.py` | rigid | `rough_field` ground with loose stones only (no static ones): 12 per robot, 10–45 cm, 80 % flat (height 15–40 % of the length, flat top and bottom faces), width 50–90 % of the length, random hulls; resting on the bumps, they tilt when stepped on near an edge |
 | `crust_collapse` | `sand.py` | sand | `sand_field` with 40 % crust patches |
 
-**Renders.** One middle-difficulty tile (row 2, d = 0.7) of each type, seed 42, with the robust policy walking for
-5 s (Newton GL viewer, which draws the terrain blue and the sand slabs and rocks white; neighboring tiles of the same
-type show at the edges). Regenerate with `probe.py view` (`scripts/reinforcement_learning/terrain/README.md`).
+**Renders.** One middle-difficulty tile (row 2 of 5: d = 0.7, for the inclines d = 0.5 = 22.5 deg) of each type,
+column 2 (a rough column for the inclines), seed 42, with the robust policy walking for 5 s, seen from the -x
+(downhill) side (Newton GL viewer, which draws the terrain blue and the sand slabs and rocks white; neighboring tiles
+of the same type show at the edges). Regenerate with `probe.py view` (`scripts/reinforcement_learning/terrain/README.md`).
 
-| `gravel` (rigid) | `stub_field` (rigid) |
+| `rough_field` (rigid) | `pit_field` (rigid) |
 | --- | --- |
-| <img src="images/gravel.jpg" width="420"> | <img src="images/stub_field.jpg" width="420"> |
-| **`rough_slope` (rigid)** | **`rough_stairs` (rigid)** |
-| <img src="images/rough_slope.jpg" width="420"> | <img src="images/rough_stairs.jpg" width="420"> |
-| **`slip_slope` (slip)** | **`sand_field` (sand)** |
-| <img src="images/slip_slope.jpg" width="420"> | <img src="images/sand_field.jpg" width="420"> |
-| **`mixed` (rigid)** | **`mesa_drop` (rigid)** |
-| <img src="images/mixed.jpg" width="420"> | <img src="images/mesa_drop.jpg" width="420"> |
-| **`loose_rocks` (rigid)** | **`crust_collapse` (sand)** |
-| <img src="images/loose_rocks.jpg" width="420"> | <img src="images/crust_collapse.jpg" width="420"> |
+| <img src="images/rough_field.jpg" width="420"> | <img src="images/pit_field.jpg" width="420"> |
+| **`stub_field` (rigid)** | **`rough_slope` (rigid)** |
+| <img src="images/stub_field.jpg" width="420"> | <img src="images/rough_slope.jpg" width="420"> |
+| **`rough_stairs` (rigid)** | **`slip_slope` (slip)** |
+| <img src="images/rough_stairs.jpg" width="420"> | <img src="images/slip_slope.jpg" width="420"> |
+| **`sand_field` (sand)** | **`gravel_field` (rigid)** |
+| <img src="images/sand_field.jpg" width="420"> | <img src="images/gravel_field.jpg" width="420"> |
+| **`crust_collapse` (sand)** | |
+| <img src="images/crust_collapse.jpg" width="420"> | |
 
 ### 3.4 Runtime physics (`mdp/events.py`)
 
@@ -141,9 +147,15 @@ applied in the world frame through the robot's permanent wrench composer; all ot
 above `collapse_force(d)` = (1.5–3) x 98 N the patch collapses: its `ke` drops from 3e4 N/m to `ke/10` (`soften`)
 or `1e-4 ke` (`disable`, the foot drops to the hardpan) for `recover_time` = 30 s.
 
-**Rocks** (`loose_rocks`). Every robot has its own copy of `dynamic_rocks` = 4 convex rocks (density 2000–3000
-kg/m³, μ 0.4–0.9, `condim` 6) on its tile's ring; rocks are placed at the first reset and left where robots push
-them; every 300 s, rocks more than 1 m from their slot are returned.
+**Stones** (`gravel_field`). Every stone is a dynamic convex body (density 2000–3000 kg/m³, μ 0.8–1.0, `condim` 6
+with torsional 0.02 / rolling 0.005 friction): high friction, so a stone stepped on near its edge tilts and rocks
+on its support instead of sliding off. MuJoCo-Warp keeps each robot in its own world, so each robot has its own
+`dynamic_rocks` = 12 stones (log-uniform 10–45 cm, stratified, so every robot has kickable stones and slabs to stand
+on), and the cost grows with the stones per robot, not with the field. The stones follow their robot: placed around
+it at the first reset, then every `recycle_interval` = 1 s, the stones more than 3 m from it (horizontally) move to
+the free spot with the most clearance among 8 random spots 1.2–3 m ahead (within ±1 rad of its walking direction),
+dropped 1 cm above the highest ground under them. The robust policy's foot scanners see only the global terrain
+(`global_world_only`), so the stones are invisible to it and a moved stone never pops into its view.
 
 The event's per-foot state (`foot_mu`, `low_mu`, `in_sand`, `collapse_event`) is public, for analyses that want it.
 
@@ -162,8 +174,8 @@ Installed: Isaac Lab 3.0.0 (`isaaclab` 41.0.1, kit-less), Newton 1.8.0.dev0 with
 | `root_physx_view.set_material_properties` | Newton `shape_material_mu` binding + `add_model_change` | Newton API |
 | `set_external_force_and_torque` | `permanent_wrench_composer.set_forces_and_torques_index(is_global=True)` | Isaac Lab 3 API |
 | `RayCasterCfg.mesh_prim_paths` with slab meshes | nothing to do | Newton's ray caster hits every collision shape of the global world, slabs and rocks included |
-| one shared `RigidObjectCollection` of 1500 rocks | `dynamic_rocks` rocks per robot, one copy per robot (4 by default) | MuJoCo-Warp simulates each robot in its own world; a body cannot be shared. 16 per robot (94 x 16 = 1504) for the stability test |
-| kinematic buried rocks | static convex colliders, one per rock, flattened to half height on the ground | static is cheaper and cannot be pushed. One convex hull per rock, not one merged triangle mesh: Newton generates no contacts between a convex hull and a triangle mesh (dynamic rocks fell through the mesh terrain at 98 m/s after 10 s) |
+| one shared `RigidObjectCollection` of 1500 rocks | `dynamic_rocks` stones per robot that follow it (12 by default) | MuJoCo-Warp simulates each robot in its own world; a body cannot be shared, so a tile-wide field would cost its full stone count per robot |
+| kinematic buried rocks | none: every stone is dynamic (the user's request of 2026-10-25) | a stone should tilt when stepped on near its edge |
 | `MeshCuboidCfg` slab, bottom at the lowest hardpan − 2 cm | box primitive (`CuboidCfg`) from the sand surface down 0.6 m | against a triangle-mesh slab, a foot sphere that sinks deeper than its radius (3.2 cm) passes the top face and is pushed through (800 and 3000 N/m both fell to the hardpan). A box pushes back along its nearest face |
 | PhysX sleeping | none; rocks get MuJoCo `condim` 6 (torsional 0.02, rolling 0.005 friction) | MuJoCo-Warp has no sleeping and ignores rigid-body damping; small resting rocks kept rocking at 1–2 cm/s |
 | slab collision toggle (`disable`) | `ke x 1e-4` | the per-contact force-space path reads `ke` every step (a change during contact takes effect in the next step); no prim or collision change at runtime |
@@ -174,8 +186,20 @@ Installed: Isaac Lab 3.0.0 (`isaaclab` 41.0.1, kit-less), Newton 1.8.0.dev0 with
 * **One terrain type per map** (2026-10-24, the user's request): a map shows one failure source at a time, and
   `fault_analysis` attributes events by task and difficulty row (`terrain_levels`) without zone labels.
 * **Difficulty without Isaac Lab's random row offset**, so a tile's difficulty is exactly its row's.
-* **Flat 1 m edge band** in every template (also pyramids, stairs, mesa), so tiles of different difficulty meet at
-  z = 0 (the spec's continuity test asks for `|z| < 2 cm` in the outer 1 m).
+* **Flat 1 m edge band** in every template but the inclines, so tiles of different difficulty meet at z = 0 (the
+  spec's continuity test asks for `|z| < 2 cm` in the outer 1 m). The inclines (one-direction slopes and stairs,
+  the user's request of 2026-10-24) cannot return to z = 0 at both ends; instead every tile of a row shares the base
+  profile, the rows are chained along x, and the border continues the edge heights (tested: the largest pixel step
+  across any tile seam is one pixel of the 45 deg incline).
+* **No vertical-surface correction** (`slope_threshold=None`): Isaac Lab's correction moves mesh vertices off the
+  grid wherever a pixel rises more than 0.75 pixel widths, which turned the 45 deg incline into one-pixel steps; the
+  collider is a heightfield of the same grid anyway, so it now equals the template exactly.
+* **Fractal roughness** (`rough`): the user asked for small plus large noise as in Minecraft-style generators;
+  value noise per octave (the reference gravel's interpolated uniform grid) is cheap (one spline per layer) and
+  keeps the fine layer's facets.
+* **Sand patchwork**: patches are axis-aligned rectangles from an irregular grid rather than freely placed
+  ellipses and squares, so they match the box slabs that fill them, and they never get closer than two flattened
+  rims (0.7 m), so no patch's rim disturbs another's surface level.
 * **Per-tile random generator** seeded by (seed, type, difficulty, tile) instead of the global NumPy state; the
   map description is byte-identical for a seed (tested).
 * **Sand patch surface** = the mean hardpan level inside the patch, with the hardpan flattened to it around the
@@ -196,7 +220,32 @@ Installed: Isaac Lab 3.0.0 (`isaaclab` 41.0.1, kit-less), Newton 1.8.0.dev0 with
 
 Euler, one RTX 4090, Newton/MJWarp, robust teacher `a2_robust_teacher_s0/model_2999.pt`, seed 42.
 
-### 5.1 Terrain-map layout (2026-10-24, after the move to `forge/terrain`)
+### 5.1 Revised terrain types (2026-10-24, 9 types)
+
+Raw logs: `tr9b_test`, `tr9_view_all`, `tr9_smoke_all` on Euler. Smoke runs: 120 s per type, 5 x 5 map, 100
+robots. The physics probes (T0, T2 sinkage and drag, T3, T6 rocks at rest and collapse) were not rerun: the slip,
+sand, collapse and rock code is unchanged (§5.2).
+
+| Test | Item | Measured | |
+| --- | --- | --- | --- |
+| T1 | `test_terrain.py` (23 tests) | 23 passed | pass |
+| T1 | edge band = base profile, flat platform, tile seams (all 9 types, 5 x 2 tiles) | 0.00 cm off the base profile, platform range 0; largest seam step 0.00 cm (zero-edge types), 3.00 cm (`rough_slope`: one pixel of 45 deg) | pass |
+| T1 | incline rows (`rough_slope`, smooth column) | 0.0, 11.2, 22.5, 33.8, 45.0 deg measured = set; row lifts 0, 2.0, 8.1, 19.0, 35.6 m | pass |
+| T1 | `rough_stairs` at 45 deg | riser 0.25 m, 37 steps per side; a rough tile's edge levels equal the clean tile's (≤ 0.5 cm) | pass |
+| T1 | `rough_field` at d = 1 | relief smoothed over 1 m spans 1.19 m; mean pixel step 0.48 cm | pass |
+| T2 | slab top vs hardpan ≤ 1 cm; patches ≥ 0.7 m apart | 0.63 cm (`sand_field`, 232 patches on 5 x 3 tiles), 0.63 cm (`crust_collapse`, 258 patches, 96 crusts) | pass |
+| T1 | generation of one 5 x 5 map | 14–16 s per type (Euler CPU) | pass |
+| T4 | spawn on the platform; no fall within 1 s (all 9 types) | 0 falls | pass |
+| T4 | real-time factor at 100 robots | rough_field 3.44, pit_field 3.54, stub_field 3.62, rough_slope 3.43, rough_stairs 3.39, slip_slope 2.66, sand_field 2.85, gravel_field 1.70, crust_collapse 2.70 | **fail** vs 5 x (as before) |
+| T6 | `gravel_field` moving-rock foot contacts ≥ 1 per minute | 83.0 per minute; a dynamic rock moves with no foot near it 0.61 % of the time | pass |
+| T6 | stability: NaN, bodies > 20 m/s on `crust_collapse` (all types) | all smoke checks pass | pass |
+
+Terminations per minute: slip_slope 109, rough_stairs 47.5, rough_slope 31.5, gravel_field 14.5, rough_field 2.5,
+stub_field 2.0, sand_field 2.0, crust_collapse 2.0, pit_field 0. The one-direction slope ends fewer episodes than
+the old pyramid (119.5 at d 0.4–1.0) although its rows reach 45 deg: its first rows are gentle (0–22.5 deg), and
+two of five columns are plain. The patchwork sand (about 15 patches per tile instead of 7) costs no speed.
+
+### 5.2 Terrain-map layout (2026-10-24, after the move to `forge/terrain`, before the type revision)
 
 Raw logs: the `tr_*` and `tr55_*` run logs on Euler. Smoke runs (`tr55_smoke_all`): 120 s per terrain type on the
 default 5 x 5 map, 100 robots (5 rows x 5 tiles x 4). The probe rows (T0, T2, T3, T6 rocks / collapse) and the
@@ -226,7 +275,7 @@ stub_field 1.0, crust_collapse 1.0 (on 3 x 10 with 120 robots and difficulty 0.4
 4, 1, 5, 3.5, 2.5, 2.5). The real-time factor rose from 1.5–1.6 (mixed map, labels) to 2.6–3.6 on all types but
 `loose_rocks` (4 dynamic rocks per robot: 1.71); 100 instead of 120 robots barely changes it.
 
-### 5.2 Measured on the Harsh World layout (2026-10-24, before the move)
+### 5.3 Measured on the Harsh World layout (2026-10-24, before the move)
 
 The templates and the runtime physics are unchanged by the move (only the tile RNG gained the tile index), so these
 results carry over. Smoke runs: 5 min, seeds 42 / 7 / 3, 84 and 120 robots on the mixed map.
@@ -267,7 +316,7 @@ touched the stairs and slopes at the platform edge within 1 s); dynamic rocks 15
   `condim` 6 rock friction, labels computed once per step; probes measure penetration, known loads, and
   window-averaged sinkage. Reason: convex rocks and deep-sinking feet passed through triangle meshes, the mesh world
   ran out of memory, and the probes measured their own artifacts.
-- 2026-10-24: Default tuning (§5.2): `slip_prob` 0.75, mesa 3–4 m terraces with 70 % cliffs, 3 m platform, 4
+- 2026-10-24: Default tuning (§5.3): `slip_prob` 0.75, mesa 3–4 m terraces with 70 % cliffs, 3 m platform, 4
   dynamic rocks per robot. Reason: T3 slide ratio, T6 flights and rock cost, T4 falls.
 - 2026-10-24: Moved to `forge/terrain` and reorganized around the templates: one module per template
   (`templates/`), one map per terrain type (3 difficulty rows x 10 tiles, the tile index in the RNG seed), one task
@@ -276,6 +325,15 @@ touched the stairs and slopes at the platform edge within 1 s); dynamic rocks 15
   event runs only the physics the type needs; `RockCfg.moving_speed` dropped, `rocks_per_cell` → `rocks_per_tile`.
   Scripts moved to `scripts/reinforcement_learning/terrain` (`build.py`, `test_terrain.py`, `probe.py` with `view`).
   Reason: failure analysis belongs to `fault_analysis`; one terrain type per simulation keeps failure sources apart.
-  Verified on Euler (§5.1).
+  Verified on Euler (§5.2).
 - 2026-10-24: Default grid 5 difficulty rows (0.4–1.0) x 5 tiles (was 3 x 10), 100 robots. Reason: the user's
   request, a square 120 x 120 m map with finer difficulty steps.
+- 2026-10-24: Terrain types revised (the user's request): `rough_slope` and `rough_stairs` are one-direction
+  inclines of 0–45 deg (plain or rough per column, `smooth_tiles`) chained along x instead of pyramids, ledges
+  dropped; new `rough_field` (fractal noise: folds plus fine bumps, `fold_size`, `fold_amplitude`, `octaves`, also
+  used by the slopes and `gravel_field`); `gravel` renamed `pit_field`; `loose_rocks` renamed `gravel_field`, now on
+  the `rough_field` ground with rocks from pebbles to 0.5 m boulders and dynamic rocks partly perched on slopes;
+  `mixed` and `mesa_drop` removed; sand patches laid out as a patchwork grid. Supporting changes:
+  `height_field_template` (extrapolated tile border), row lift and edge-following border in the generator,
+  `slope_threshold=None`, per-template `difficulty_range`. Reason: realistic inclines a robot climbs or descends,
+  realistic uneven ground, and sand patches that look natural. Verified on Euler (§5.1).
