@@ -12,7 +12,7 @@ one map per terrain type (5 difficulty rows x 5 tiles), played by a trained A2 p
 | [test_terrain.py](test_terrain.py) | Geometry tests of every template and the tile grid (pytest) | CPU only |
 | [probe.py](probe.py) | Simulator probes: `ground`, `sand`, `collapse`, `rocks`, `slip`, `smoke`; `view` renders PNGs | GPU (Newton) |
 
-Failure analysis is [`fault_analysis/`](../fault_analysis/README.md)'s job: its `collect.py` and `render.py` take
+Failure analysis is [`fault_analysis/`](../../forge/fault_analysis/README.md)'s job: its `collect.py` and `render.py` take
 these tasks like any other (tested with `SandField`).
 
 ## Terrain types
@@ -55,7 +55,7 @@ euler enqueue tr_view -- python $P/probe.py view /workspace/isaaclab/logs/terrai
 rsync -a euler:/cluster/project/rsl/hyelee/euler-toolkit/isaaclab3/logs/terrain/view logs/terrain/
 
 # 4. play a trained policy on one terrain type and record failures (fault_analysis, unchanged)
-euler enqueue fault_slope -- python scripts/reinforcement_learning/fault_analysis/collect.py \
+euler enqueue fault_slope -- python scripts/forge/fault_analysis/collect.py \
     --task IsaacContrib-Terrain-RoughSlope-A2Robust --num_envs 100 --max_steps 15000 --checkpoint $CK
 ```
 

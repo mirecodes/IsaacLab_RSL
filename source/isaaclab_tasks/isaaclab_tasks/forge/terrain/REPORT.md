@@ -11,7 +11,7 @@
 Terrain-generation algorithms ("templates") for observing failures of trained policies. A task's map holds one
 terrain type: 5 difficulty rows x 5 tiles, each tile with its own random layout. A trained A2 policy
 walks it under random commands; its observations and actions are untouched, so its checkpoint loads as it is.
-Failure analysis is left to `scripts/reinforcement_learning/fault_analysis` (`collect.py`, `analyze.py`,
+Failure analysis is left to `scripts/forge/fault_analysis` (`collect.py`, `analyze.py`,
 `render.py`), which takes these tasks like any other task with a generated terrain.
 
 Until 2026-10-24 this was the "Harsh World" (`velocity/a2_harsh_world`): all ten types side by side on one map, with

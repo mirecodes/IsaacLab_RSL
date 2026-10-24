@@ -15,13 +15,13 @@ On Euler (the container's cwd is the repo root, and `logs/` is the profile's log
 
 ```bash
 # collect: 4096 robots by default; stops at --max_events events or --max_steps env steps
-euler enqueue fault_a2_robust -- python scripts/reinforcement_learning/fault_analysis/collect.py \
+euler enqueue fault_a2_robust -- python scripts/forge/fault_analysis/collect.py \
     --task IsaacContrib-Velocity-A2Study-RobustTeacher \
     --checkpoint /workspace/isaaclab/logs/rsl_rl/a2_study_robust_teacher/2026-10-23_11-54-58_a2_robust_teacher_s0/model_2999.pt \
     --max_events 2000
 
 # render selected events (default: all) of one collection
-euler enqueue fault_render -- python scripts/reinforcement_learning/fault_analysis/render.py \
+euler enqueue fault_render -- python scripts/forge/fault_analysis/render.py \
     /workspace/isaaclab/logs/fault_analysis/a2_study_robust_teacher/<collection> --events 0 5 12
 
 euler fetch fault_analysis   # -> results/euler/isaaclab3/fault_analysis/... (events, terrain, videos)
@@ -30,7 +30,7 @@ euler fetch fault_analysis   # -> results/euler/isaaclab3/fault_analysis/... (ev
 Replay on the Linux machine, in the local Isaac container. `docker-compose.codes.yaml` mounts `~/hyeslee/results` at `/workspace/results`:
 
 ```bash
-python scripts/reinforcement_learning/fault_analysis/render.py \
+python scripts/forge/fault_analysis/render.py \
     /workspace/results/euler/isaaclab3/fault_analysis/a2_study_robust_teacher/<collection> \
     --events 12 --viz kit --real_time   # live window at wall-clock speed; the mp4 is written too
 ```
@@ -59,9 +59,9 @@ Flag the rules on a fetched collection. Any Python with numpy works (the Isaac c
 ```bash
 R=results/euler/isaaclab3/fault_analysis
 # thresholds from normal walking: frames >= 2 s before the leg-contact onsets of the smoke collection
-python scripts/reinforcement_learning/fault_analysis/analyze.py $R/smoke/rough2
+python scripts/forge/fault_analysis/analyze.py $R/smoke/rough2
 # flag the failures against those thresholds
-python scripts/reinforcement_learning/fault_analysis/analyze.py $R/a2_study_robust_teacher/2026-10-24_rough_terminal \
+python scripts/forge/fault_analysis/analyze.py $R/a2_study_robust_teacher/2026-10-24_rough_terminal \
     --thresholds $R/smoke/rough2/thresholds.json
 ```
 
@@ -81,7 +81,7 @@ It writes `flags.csv` and `thresholds.json` into the collection, and prints the 
 import json
 import sys
 
-sys.path.insert(0, "scripts/reinforcement_learning/fault_analysis")
+sys.path.insert(0, "scripts/forge/fault_analysis")
 import analyze
 
 meta, rows = analyze.load_collection(c)

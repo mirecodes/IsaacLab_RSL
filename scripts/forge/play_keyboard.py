@@ -14,7 +14,7 @@ Spawns one robot (``--num_envs`` overrides), follows it with the viewport camera
 
 Keys add while held and subtract on release. Needs a Kit window (the keyboard is read through carb), e.g.::
 
-    ./isaaclab.sh -p scripts/reinforcement_learning/play_keyboard.py \\
+    ./isaaclab.sh -p scripts/forge/play_keyboard.py \\
         --task IsaacContrib-Velocity-Go2Study-Base --checkpoint logs/rsl_rl/<exp>/<run>/model_1500.pt --viz kit
 """
 

@@ -15,7 +15,7 @@ Every robot keeps a ring buffer of the last ``--buffer_s`` seconds of its state.
 See ``README.md`` next to this file for the data layout. Runs headless until ``--max_events`` events or
 ``--max_steps`` env steps, e.g. on Euler::
 
-    euler enqueue fault_a2_robust -- python scripts/reinforcement_learning/fault_analysis/collect.py \\
+    euler enqueue fault_a2_robust -- python scripts/forge/fault_analysis/collect.py \\
         --task IsaacContrib-Velocity-A2Study-RobustTeacher \\
         --checkpoint /workspace/isaaclab/logs/rsl_rl/a2_study_robust_teacher/<run>/model_2999.pt
 """

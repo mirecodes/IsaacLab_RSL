@@ -9,7 +9,7 @@ The motion is replayed kinematically: every frame writes the logged base pose an
 without stepping physics. The terrain is regenerated from the task and seed in ``meta.json`` and checked
 against the saved ``terrain.npz``. Videos land in ``<collection>/videos/<event>.mp4``::
 
-    euler enqueue fault_render -- python scripts/reinforcement_learning/fault_analysis/render.py \\
+    euler enqueue fault_render -- python scripts/forge/fault_analysis/render.py \\
         /workspace/isaaclab/logs/fault_analysis/<experiment>/<collection> --events 0 3 17
 """
 
