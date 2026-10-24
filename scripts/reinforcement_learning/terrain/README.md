@@ -84,6 +84,6 @@ through the terrain), so CPU runs only check that the code runs.
 | `slip.mu_slip_easy`, `slip.mu_slip_hard`, `slip.slip_prob` | (0.05, 0.35), (0.03, 0.25), 0.75 | low-friction sample per foot on slip terrain |
 | `sand.c_drag`, `sand.c_suction`, `sand.force_limit` | (20, 80), (30, 150) N s/m, 60 N | drag on feet in the sand |
 | `collapse.collapse_force`, `collapse_mode`, `recover_time` | (1.5, 3) x 98 N, `soften`, 30 s | crust collapse |
-| `rocks.dynamic_rocks`, `rocks.size`, `rocks.friction` | 12 per robot, (0.10, 0.45) m, (0.8, 1.0) | loose stones of `gravel_field`, all dynamic; they follow their robot |
+| `rocks.dynamic_rocks`, `rocks.size`, `rocks.friction` | 8 per robot, (0.10, 0.45) m, (0.8, 1.0) | loose stones of `gravel_field`, all dynamic; they follow their robot |
 | `rocks.recycle_interval`, `recycle_radius`, `ahead`, `sector` | 1 s, 3 m, (1.2, 3.0) m, 1 rad | stones left behind move to free spots ahead |
 | `terrains["gravel_field"].flat_frac`, `.flat_height`, `.width_ratio` | 0.8, (0.15, 0.4), (0.5, 0.9) | stone shapes |

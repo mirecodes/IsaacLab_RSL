@@ -49,6 +49,9 @@ def main() -> None:
     parser.add_argument("collection", help="Collection directory written by collect.py.")
     parser.add_argument("--events", type=int, nargs="*", default=None, help="Event ids (default: all).")
     parser.add_argument("--count", type=int, default=None, help="Without --events: the first N full-window events.")
+    parser.add_argument(
+        "--pick", type=int, default=None, help="Without --events: N full-window failures evenly spread over sim time."
+    )
     parser.add_argument("--eye", type=float, nargs=3, default=(-1.0, -1.0, 0.6), help="Camera offset [m].")
     render_args, argv = parser.parse_known_args(sys.argv[1:])
     collection = os.path.abspath(render_args.collection)
@@ -58,8 +61,14 @@ def main() -> None:
     if events is None:
         with open(os.path.join(collection, "index.csv")) as f:
             rows = list(csv.DictReader(f))
-        if render_args.count is not None:
-            rows = [r for r in rows if int(r["num_frames"]) == meta["num_frames"]][: render_args.count]
+        full = [r for r in rows if int(r["num_frames"]) == meta["num_frames"]]
+        if render_args.pick is not None:
+            full = [r for r in full if r["terminal"] == "True"]
+            times = np.array([float(r["sim_time_s"]) for r in full])
+            targets = np.linspace(times.min(), times.max(), render_args.pick) if len(full) else []
+            rows = [full[i] for i in sorted({int(np.abs(times - t).argmin()) for t in targets})]
+        elif render_args.count is not None:
+            rows = full[: render_args.count]
         events = [int(r["event"]) for r in rows]
 
     args_cli = _parse_args(["--task", meta["task"], "--num_envs", "1", "--seed", str(meta["seed"]), *argv])

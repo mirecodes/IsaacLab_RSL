@@ -24,21 +24,23 @@ from .rough_field import RoughFieldCfg
 
 
 def rock_mesh(seed: int, template: int, size: float, axis_ratio, yaw: float) -> trimesh.Trimesh:
-    """Random convex stone: hull of 12-30 noisy points on an ellipsoid, largest extent ``size``, with a flat top and
-    bottom face (the highest and lowest quarter of the points, at least three each, moved to 70 % of the half height;
-    stones split and weather along planes).
+    """Random convex stone: hull of 12-30 noisy points on a sphere with a flat top and bottom face (heights clipped
+    to 70 % of the radius, and the highest and lowest quarter of the points, at least three each, moved onto those
+    planes; stones split and weather along planes), scaled to a box of ``size`` x ``axis_ratio`` (y/x, z/x) x
+    ``size``.
 
-    The template index fixes the point cloud (16 templates per seed); ``axis_ratio`` (y/x, z/x) and ``yaw`` shape
-    the instance. The bottom is at ``z = 0``.
+    The template index fixes the point cloud (16 templates per seed); ``yaw`` turns the instance. The bottom is at
+    ``z = 0``.
     """
     rng = np.random.default_rng([seed, 7, template])
     points = rng.normal(size=(int(rng.integers(12, 31)), 3))
     points /= np.linalg.norm(points, axis=1, keepdims=True)
     points *= rng.uniform(0.8, 1.0, (len(points), 1))
-    half = np.array([1.0, axis_ratio[0], axis_ratio[1]]) * size / 2
-    points *= half
+    points[:, 2] = np.clip(points[:, 2], -0.7, 0.7)
     order, n = np.argsort(points[:, 2]), max(3, len(points) // 4)
-    points[order[:n], 2], points[order[-n:], 2] = -0.7 * half[2], 0.7 * half[2]
+    points[order[:n], 2], points[order[-n:], 2] = -0.7, 0.7
+    points = (points - points.min(0)) / np.ptp(points, 0) - 0.5
+    points *= np.array([1.0, axis_ratio[0], axis_ratio[1]]) * size
     c, s = np.cos(yaw), np.sin(yaw)
     points[:, :2] = points[:, :2] @ np.array([[c, s], [-s, c]])
     hull = trimesh.convex.convex_hull(points)
@@ -46,9 +48,10 @@ def rock_mesh(seed: int, template: int, size: float, axis_ratio, yaw: float) -> 
     return hull
 
 
-def stone_shape(rng: np.random.Generator, cfg: GravelFieldCfg) -> list[float]:
-    """``axis_ratio`` (width / length, height / length) of one stone: flat with probability ``flat_frac``."""
-    flat = rng.uniform() < cfg.flat_frac
+def stone_shape(rng: np.random.Generator, cfg: GravelFieldCfg, size: float) -> list[float]:
+    """``axis_ratio`` (width / length, height / length) of a stone of length ``size``: flat with probability
+    ``flat_frac``, always flat above ``round_max``."""
+    flat = size > cfg.round_max or rng.uniform() < cfg.flat_frac
     return [rng.uniform(*cfg.width_ratio), rng.uniform(*(cfg.flat_height if flat else cfg.round_height))]
 
 
@@ -64,5 +67,7 @@ class GravelFieldCfg(RoughFieldCfg):
     """Height / length of a flat stone, uniform."""
     round_height: Range = (0.5, 1.0)
     """Height / length of a round stone, uniform."""
+    round_max: float = 0.2
+    """Stones longer than this [m] are always flat: a large round boulder is not a stone to step on."""
     template_count: int = 16
     """Point clouds the stone hulls are drawn from."""

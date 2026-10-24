@@ -26,11 +26,14 @@ from isaaclab_tasks.forge.velocity.a2_velocity.energy_env_cfg import A2EnergyTea
 from isaaclab_tasks.forge.velocity.a2_velocity.robust_env_cfg import A2RobustTeacherEnvCfg
 
 from .mdp import events
-from .mdp.generator import ROCK_COLOR, TerrainGridImporterCfg
+from .mdp.generator import TerrainGridImporterCfg
 from .templates.gravel_field import rock_mesh
 from .world_cfg import TerrainWorldCfg
 
 FEET = ["FL_foot", "FR_foot", "RL_foot", "RR_foot"]
+
+
+ROCK_COLOR = (0.45, 0.43, 0.40)
 
 
 def rocks_cfg(world: TerrainWorldCfg) -> RigidObjectCollectionCfg:

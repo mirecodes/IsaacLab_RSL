@@ -347,7 +347,11 @@ def main():
     parser.add_argument("--percentile", type=float, default=99.9, help="Spike threshold percentile.")
     parser.add_argument("--grace_s", type=float, default=None, help="Spawn grace (default: the collection's).")
     parser.add_argument("--thresholds", default=None, help="Reuse a thresholds.json instead of a baseline.")
+    parser.add_argument(
+        "--rules", nargs="+", default=[""], help="Flag only rules starting with these, e.g. A_tilt C (default: all)."
+    )
     args = parser.parse_args()
+    rules = [rule for rule in RULES if rule.startswith(tuple(args.rules))]
 
     meta, rows = load_collection(args.collection)
     grace_s = meta["args"]["grace_s"] if args.grace_s is None else args.grace_s
@@ -362,12 +366,12 @@ def main():
 
     dt = meta["step_dt"]
     header = ["event", "terminal", "terminations", "num_frames"]
-    header += [f"{r}{s}" for r in RULES for s in ("", "_first_s", "_last_s")]
+    header += [f"{r}{s}" for r in rules for s in ("", "_first_s", "_last_s")]
     second = round(1.0 / dt)
     table = []
     # summary counts: rule hit in the window, in its last second, and in the first second of full windows
     # (normal walking 4-5 s before the event, the reference rate of a rule)
-    count = {rule: np.zeros(3, dtype=int) for rule in RULES}
+    count = {rule: np.zeros(3, dtype=int) for rule in rules}
     num_full = 0
     for row in rows:
         e = load_event(args.collection, row)
@@ -376,7 +380,7 @@ def main():
         full = n == meta["num_frames"]
         num_full += full
         out = [row["event"], row["terminal"], row["terminations"], n]
-        for rule in RULES:
+        for rule in rules:
             hits = np.flatnonzero(masks[rule])
             out += [int(len(hits) > 0)]
             out += [f"{(hits[0] - n + 1) * dt:.2f}", f"{(hits[-1] - n + 1) * dt:.2f}"] if len(hits) else ["", ""]
@@ -389,7 +393,7 @@ def main():
 
     print(f"[analyze] {len(table)} events ({num_full} full windows), baseline {thresholds['baseline_frames']} frames")
     print(f"{'rule':22s} {'window':>7s} {'last 1 s':>9s} {'first 1 s':>10s}")
-    for rule in RULES:
+    for rule in rules:
         c = count[rule]
         print(f"{rule:22s} {c[0] / len(table):7.1%} {c[1] / len(table):9.1%} {c[2] / max(num_full, 1):10.1%}")
     print(f"[analyze] wrote flags.csv and thresholds.json to {args.collection}")

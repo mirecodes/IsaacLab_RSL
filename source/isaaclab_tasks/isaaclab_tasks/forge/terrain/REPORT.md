@@ -105,7 +105,7 @@ outer border (5 m) continues the height of each edge pixel outward instead of si
 | `rough_stairs` | `stairs.py` | rigid | one-direction stairs at `slope_deg` 0–45 deg: tread `step_width` 0.35→0.25 m, riser `tread x tan θ` (0.25 m at 45 deg), up along +x and down along -x from the landing; rough columns: treads `U(0.8, 1.2)` (rescaled to the clean flight's length), step edges eroded (`edge_jitter` ≤ 8 cm), ≤ 3 cm noise |
 | `slip_slope` | `slope.py` | slip | incline of 18–30 deg (d 0.4–1.0), fine noise ≤ 3 cm on the rough columns, no folds |
 | `sand_field` | `sand.py` | sand | rough hardpan; patchwork of patches: the tile is cut into an irregular grid (cells 1.2–4.5 m per column and row), 25–45 % of the cells hold a rectangle inset by 0.4 + U(0, 0.6) m per side; each patch flattened to its mean level `s` around the slab footprint, interior lowered by `sand_depth` keeping half the roughness, 0.1 m ramp |
-| `gravel_field` | `gravel_field.py` | rigid | `rough_field` ground with loose stones only (no static ones): 12 per robot, 10–45 cm, 80 % flat (height 15–40 % of the length, flat top and bottom faces), width 50–90 % of the length, random hulls; resting on the bumps, they tilt when stepped on near an edge |
+| `gravel_field` | `gravel_field.py` | rigid | `rough_field` ground with loose stones only (no static ones): 8 per robot, 10–45 cm, 80 % flat (all above 20 cm) (height 15–40 % of the length, flat top and bottom faces), width 50–90 % of the length, random hulls; resting on the bumps, they tilt when stepped on near an edge |
 | `crust_collapse` | `sand.py` | sand | `sand_field` with 40 % crust patches |
 
 **Renders.** One middle-difficulty tile (row 2 of 5: d = 0.7, for the inclines d = 0.5 = 22.5 deg) of each type,
@@ -150,11 +150,11 @@ or `1e-4 ke` (`disable`, the foot drops to the hardpan) for `recover_time` = 30 
 **Stones** (`gravel_field`). Every stone is a dynamic convex body (density 2000–3000 kg/m³, μ 0.8–1.0, `condim` 6
 with torsional 0.02 / rolling 0.005 friction): high friction, so a stone stepped on near its edge tilts and rocks
 on its support instead of sliding off. MuJoCo-Warp keeps each robot in its own world, so each robot has its own
-`dynamic_rocks` = 12 stones (log-uniform 10–45 cm, stratified, so every robot has kickable stones and slabs to stand
+`dynamic_rocks` = 8 stones (log-uniform 10–45 cm, stratified, so every robot has kickable stones and slabs to stand
 on), and the cost grows with the stones per robot, not with the field. The stones follow their robot: placed around
 it at the first reset, then every `recycle_interval` = 1 s, the stones more than 3 m from it (horizontally) move to
-the free spot with the most clearance among 8 random spots 1.2–3 m ahead (within ±1 rad of its walking direction),
-dropped 1 cm above the highest ground under them. The robust policy's foot scanners see only the global terrain
+the free spot with the most clearance among 8 random spots 1.2–3 m ahead (within ±1 rad of its walking direction,
+clamped to the tile grid), dropped 1 cm above the highest ground under them. The robust policy's foot scanners see only the global terrain
 (`global_world_only`), so the stones are invisible to it and a moved stone never pops into its view.
 
 The event's per-foot state (`foot_mu`, `low_mu`, `in_sand`, `collapse_event`) is public, for analyses that want it.
@@ -174,7 +174,7 @@ Installed: Isaac Lab 3.0.0 (`isaaclab` 41.0.1, kit-less), Newton 1.8.0.dev0 with
 | `root_physx_view.set_material_properties` | Newton `shape_material_mu` binding + `add_model_change` | Newton API |
 | `set_external_force_and_torque` | `permanent_wrench_composer.set_forces_and_torques_index(is_global=True)` | Isaac Lab 3 API |
 | `RayCasterCfg.mesh_prim_paths` with slab meshes | nothing to do | Newton's ray caster hits every collision shape of the global world, slabs and rocks included |
-| one shared `RigidObjectCollection` of 1500 rocks | `dynamic_rocks` stones per robot that follow it (12 by default) | MuJoCo-Warp simulates each robot in its own world; a body cannot be shared, so a tile-wide field would cost its full stone count per robot |
+| one shared `RigidObjectCollection` of 1500 rocks | `dynamic_rocks` stones per robot that follow it (8 by default) | MuJoCo-Warp simulates each robot in its own world; a body cannot be shared, so a tile-wide field would cost its full stone count per robot |
 | kinematic buried rocks | none: every stone is dynamic (the user's request of 2026-10-25) | a stone should tilt when stepped on near its edge |
 | `MeshCuboidCfg` slab, bottom at the lowest hardpan − 2 cm | box primitive (`CuboidCfg`) from the sand surface down 0.6 m | against a triangle-mesh slab, a foot sphere that sinks deeper than its radius (3.2 cm) passes the top face and is pushed through (800 and 3000 N/m both fell to the hardpan). A box pushes back along its nearest face |
 | PhysX sleeping | none; rocks get MuJoCo `condim` 6 (torsional 0.02, rolling 0.005 friction) | MuJoCo-Warp has no sleeping and ignores rigid-body damping; small resting rocks kept rocking at 1–2 cm/s |

@@ -1,15 +1,37 @@
 # Fault analysis
 
-These scripts play a trained RSL-RL locomotion policy on thousands of robots in parallel. They save the 5 s of motion before every event: the onset of a non-foot contact, or a real failure (a task termination). Saved events can then be flagged with the fault rules A–E and replayed as videos that follow the robot over the same terrain.
+These scripts play a trained RSL-RL locomotion policy on many robots in parallel. They save the 5 s of motion before every failure: base contact (the only failure term kept by default), optionally also the onset of a non-foot contact. Every episode's end and length is logged, for success rates per difficulty. Saved events can then be flagged with the fault rules A–E, one rule or group at a time, and replayed as videos that follow the robot over the same terrain. `campaign.py` runs this for every (policy, terrain map) of `forge/terrain`.
 
 | File | What it does |
 | --- | --- |
 | [collect.py](collect.py) | Headless parallel play. It saves the last `--buffer_s` seconds before every event. |
 | [analyze.py](analyze.py) | Offline, numpy only. It flags which fault rules (A–E) each saved window hits, and when. |
 | [render.py](render.py) | Replays saved events on the regenerated terrain and writes one robot-tracking mp4 per event. |
-| [test_analyze.py](test_analyze.py) | Checks of the geometry helpers of `analyze.py`. |
+| [campaign.py](campaign.py) | Standard library only. Queues one collect + render job per (policy, terrain map) on Euler, and tabulates their `summary.json` files. |
+| [test_analyze.py](test_analyze.py), [test_campaign.py](test_campaign.py) | Checks of the geometry helpers of `analyze.py` and of the summary of `campaign.py`. |
 
 ## Usage
+
+### Campaign on the terrain maps
+
+```bash
+python scripts/forge/fault_analysis/campaign.py enqueue --name terrain_v1    # 2 policies x 9 terrains = 18 jobs
+euler status                                                                 # jobs run one after another
+euler fetch fault_analysis/terrain_v1
+python scripts/forge/fault_analysis/campaign.py report results/euler/isaaclab3/fault_analysis/terrain_v1
+```
+
+Each job plays `IsaacContrib-Velocity-A2Deploy-<Type>-{Robust,Energy}` (`forge/velocity/a2_deploy`; robust teacher
+`model_2999`, energy teacher rough `model_2999`): the terrain map's difficulty rows 1–3 (d = 0.4, 0.55, 0.7;
+inclines 0, 11.25, 22.5°), 20 robots that start every episode on a random tile, forward-only commands with smooth
+turns of at most ±45° (robust policy; the energy policy has no command input). On the inclines (`rough_slope`,
+`rough_stairs`, `slip_slope`) the robots face straight up or down the slope (±15°) and get no turn command. It stops at 200 falls or 30 min of
+sim time, then renders 10 falls spread evenly over the play. `report` writes `report.md` into the campaign directory: per (policy, terrain, difficulty row) the
+episodes, successes, falls, success rate, mean episode length, mean time to fall, and the play's sim and wall time.
+`enqueue` options: `--policies`, `--terrains`, `--failures` 200, `--minutes` 30, `--videos` 10, `--dry_run` (print
+the `euler` commands only).
+
+### Single collections
 
 On Euler (the container's cwd is the repo root, and `logs/` is the profile's log directory):
 
@@ -41,16 +63,17 @@ python scripts/forge/fault_analysis/render.py \
 | --- | --- | --- |
 | `--buffer_s` | 5.0 | Seconds kept before each event. |
 | `--max_events` / `--max_steps` | 1000 / none | When to stop. |
-| `--foot_bodies` | `.*_foot` | Regex for the foot bodies. Contact on any other body is an event. |
+| `--terminations` | `base_contact` | Failure terms kept; the task's others (e.g. `bad_orientation`) are removed. Time-outs stay. |
+| `--contact_onsets` | off | Also record the onset of a non-foot contact as an event (the robot keeps walking). |
+| `--foot_bodies` | `.*_foot` | Regex for the foot bodies. With `--contact_onsets`, contact on any other body is an event. |
 | `--contact_threshold` | 1.0 | Trigger force [N], the same as the stock `base_contact` termination. |
 | `--grace_s` | 1.0 | Contact onsets this soon after a (re)spawn are ignored: the reset pose often puts a calf on the ground. |
-| `--terminal_only` | off | Record only task terminations, not leg-contact onsets. |
 | `--disturbances` | off | Keep the task's random pushes and external wrench. |
 | `--sub_terrains` | all | Keep only these sub-terrains of the task's generator, e.g. `hills rough_discrete` (heightfield rough ground, no blocks or stairs). |
 | `--output_dir` | `logs/fault_analysis/<experiment>/<time>_<run>_<model>` | Where the collection is written. |
-| `--num_envs`, `--seed`, `--checkpoint`, … | | Same as `play.py`. `--num_envs` defaults to 4096. |
+| `--num_envs`, `--seed`, `--checkpoint`, … | | Same as `play.py`. `--num_envs` defaults to the task's. |
 
-`render.py` takes the collection directory, `--events <ids>`, `--eye dx dy dz` (camera offset from the base, default `-1 -1 0.6` m), `--real_time`, and `--viz` like `play.py`. It reapplies the collection's `--sub_terrains` and seed, so it needs no other arguments.
+`render.py` takes the collection directory, `--events <ids>` or `--pick N` (N full-window failures nearest to N evenly spaced sim times), `--eye dx dy dz` (camera offset from the base, default `-1 -1 0.6` m), `--real_time`, and `--viz` like `play.py`. It reapplies the collection's `--sub_terrains` and seed, so it needs no other arguments.
 
 Run both scripts as queued jobs (`euler enqueue`), not `euler exec`: an `exec` step got OOM-killed on host memory where the same queued command ran fine.
 
@@ -74,6 +97,7 @@ python scripts/forge/fault_analysis/analyze.py $R/a2_study_robust_teacher/2026-1
 | `--percentile` | 99.9 | Spike threshold; low-tail rules use `100 - percentile`. |
 | `--thresholds` | – | Reuse a `thresholds.json` instead of computing a baseline. |
 | `--grace_s` | the collection's | Frames this soon after a spawn are never flagged or used as baseline. |
+| `--rules` | all | Flag only the rules starting with these, e.g. `--rules A_tilt` or `--rules B C_slip`, to turn rules on one at a time. |
 
 It writes `flags.csv` and `thresholds.json` into the collection, and prints the share of events that hit each rule in the window, in its last second, and in the first second of full windows (4–5 s before the event, the rule's base rate in normal walking). The masks per frame are available from Python:
 
@@ -91,6 +115,8 @@ masks["B_value_drop"]  # [T] bool; the last frame is the event step
 ```
 
 ## Collections
+
+The collections below were deleted on 2026-10-25 (Euler and local); only the results quoted here remain. They used the old trigger (task terminations including tilt, plus leg-contact onsets).
 
 | Collection (under `logs/fault_analysis/`) | Setup | Content |
 | --- | --- | --- |
@@ -110,6 +136,11 @@ Every file of a collection lives in one directory:
   meta.json        task, checkpoint, seed, step_dt, joint/body names, masses, limits, field shapes, CLI args
   env.yaml         full env config as played
   terrain.npz      vertices [V,3] and faces [F,3] (world frame), env_origins [N,3], terrain_origins [rows,cols,3]
+  summary.json     per difficulty row and in total: episodes, successes, failures, success rate, mean episode and
+                   time-to-failure [s], robot time; plus sim / wall time [s] of the play and why it stopped
+  episodes.csv     one row per episode: episode, env_id, end_step, end_time_s, duration_s, terrain_level,
+                   terrain_type, outcome (first termination hit, or running at the end), failure
+  terrain_map.yaml terrain maps only: the map description (tiles, difficulties, patches)
   index.csv        one row per event: event, env_id, step, sim_time_s, episode_step, num_frames,
                    terrain_level, terrain_type, terminal, terminations, base_contact, contact_bodies
   events/<id>.npz  one event: [T, ...] arrays per field (T <= 250 at 50 Hz), plus env_id, step,
@@ -154,7 +185,7 @@ Frame `t` is sampled at the end of env step `t`, before any reset. It holds the 
 
 ## Rule flags
 
-Only the triggers (non-foot contact onset, task termination) run online. The rules A–E are labels: `analyze.py` gives each a per-frame mask over the saved window, and they never decide what is recorded. A rule is either *fixed* (a physical threshold, `FIXED` in `analyze.py`) or *spike* (a signal past the `--percentile` of normal walking, `SPIKES`). Foot contact is the contact sensor's own state (`contact_time > 0`); a touchdown is the first contact frame after air time.
+Only the trigger (base contact; with `--contact_onsets` also non-foot contact onsets) runs online. The rules A–E are labels: `analyze.py` gives each a per-frame mask over the saved window, and they never decide what is recorded. A rule is either *fixed* (a physical threshold, `FIXED` in `analyze.py`) or *spike* (a signal past the `--percentile` of normal walking, `SPIKES`). Foot contact is the contact sensor's own state (`contact_time > 0`); a touchdown is the first contact frame after air time.
 
 | Rule | Kind | Hit when |
 | --- | --- | --- |
@@ -206,7 +237,8 @@ The 89 % ceiling is the 267 failures more than 1 s after a spawn: frames inside 
 
 Choices the request left open, and how they were made here:
 
-- **Trigger: non-foot contact onset, plus real failures.** The first version reset a robot at its first non-foot contact. Its smoke test (A2 robust teacher, 512 robots, all terrains) showed this was the wrong design: 45% of events came on the first step after spawn, because the reset pose puts a calf on the ground. The rest were thigh and calf hits during otherwise normal walking (median tilt 7°, base 0.36 m above the terrain, critic value unchanged), and base contact occurred 0 times. Resetting on those events cut every episode short, so real falls never had a chance to happen. The current design:
+- **Trigger: base contact only (2026-10-25).** The user's request: a fall is the base touching the ground; tilt no longer ends an episode or triggers a recording, and the rules A–E (tilt among them, `A_tilt`) are evaluated afterwards, one at a time if wanted (`analyze.py --rules`). Leg-contact onsets are recorded only with `--contact_onsets`. The history of the earlier trigger follows.
+- **Earlier trigger: non-foot contact onset, plus real failures.** The first version reset a robot at its first non-foot contact. Its smoke test (A2 robust teacher, 512 robots, all terrains) showed this was the wrong design: 45% of events came on the first step after spawn, because the reset pose puts a calf on the ground. The rest were thigh and calf hits during otherwise normal walking (median tilt 7°, base 0.36 m above the terrain, critic value unchanged), and base contact occurred 0 times. Resetting on those events cut every episode short, so real falls never had a chance to happen. The current design:
   - An event is recorded at the onset of a non-foot contact. Onsets inside the `--grace_s` spawn grace are ignored, and each robot records at most one onset per buffer length (5 s) so windows do not overlap. The robot keeps walking.
   - Robots are reset only by the task's own terminations (robust teacher: base contact, tilt > 1 rad) and time-outs. A termination is always recorded, even inside the 5 s, with `terminal=True` and the term names in `terminations`.
   - The data therefore separates "the leg touched but the robot went on" (`terminal=False`) from "the robot failed" (`terminal=True`), and `base_contact` / `contact_bodies` say what touched. `--terminal_only` keeps only failures. If calves should not count at all, pass `--foot_bodies '.*_(foot|calf)'`.
@@ -225,9 +257,12 @@ Choices the request left open, and how they were made here:
   - Torque saturation is detected as clipping (`computed_torque != applied_torque`), not as $\lvert\tau\rvert \approx \tau_{max}$: the A2 actuator's speed-dependent curve clips well below the effort limit (e.g. 159 of 180 N·m).
   - Sinking is measured against the foot's own touchdown height, not against the terrain mesh. On rigid ground it mostly catches a foot sliding down a slope; on deformable terrain it is the intended sinking.
 - **Baseline.** Normal walking is taken from the windows themselves: frames at least 2 s before the event and 1 s after a spawn. `smoke/rough2` (3418 leg-contact onsets, 6 failures) is the better baseline because it does not contain the seconds leading to a fall. Spike rules hit by construction about 0.1 % of normal frames, so read their rate against the "first 1 s" column, not against zero.
+- **Campaign layout.** Success = an episode that ends without a failure term: by time-out (60 s) or by leaving its spawn tile (`left_tile`, added by `collect.py` on terrain maps as a time-out). Leaving the tile ends the episode because rows have different difficulties and the robots walk forward (out of a 24 m tile in 12–25 s): without it a robot would fall on a neighboring row and be counted on its spawn row. "Level 1–3" is read as the first three of the map's five rows, at the full map's difficulties. The task (`a2_deploy`) fixes the map, the 20 robots, and their random tiles; `collect.py` keeps a terrain map's curriculum (the tile draw) and seeds its generator with the env seed. 30 min is sim time (`--max_steps 90000`); the wall time is in `summary.json`. Videos are picked evenly over sim time per (policy, terrain), from full 5 s windows.
 - **Storage.** The ring buffer stays on the GPU and costs about `num_envs × 250 × fields × 4 B`. For the A2 robust teacher that is about 1000 floats per frame, or roughly 4 GB at 4096 robots. Lower `--num_envs` on smaller GPUs. Each event is written as compressed `.npz` (≈0.3–0.5 MB).
 
 ## Changelog
+
+- 2026-10-25: Trigger is base contact only (`--terminations`, default `base_contact`; `--contact_onsets` replaces `--terminal_only`). `episodes.csv`, `summary.json`, `left_tile`, and kept terrain-map curricula in `collect.py` (`--num_envs` now defaults to the task's); `render.py --pick`; `analyze.py --rules`; `campaign.py` on the new deploy tasks (`forge/velocity/a2_deploy`). Scripts moved from `scripts/reinforcement_learning/` to `scripts/forge/`. Reason: the user's request (success rates per difficulty on the terrain maps, rules turned on one at a time during analysis).
 
 - 2026-10-24: `analyze.py` flags the rules A–E on saved windows (`flags.csv`, `thresholds.json`), with baseline percentiles from normal walking; flagged `2026-10-24_rough_terminal` against `smoke/rough2`.
 - 2026-10-24: Collected `2026-10-24_rough_terminal`. `render.py` gained `--count`, a closer default camera, and hidden command markers.

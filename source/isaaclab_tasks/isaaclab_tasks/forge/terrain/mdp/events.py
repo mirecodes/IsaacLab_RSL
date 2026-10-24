@@ -280,9 +280,9 @@ class terrain_step(ManagerTermBase):
         ahead of it; returns the number moved.
 
         Spots: ``candidates`` random points at ``ahead`` distance within ``sector`` of the walking direction (the
-        heading below 0.2 m/s); each stone takes the one with the most clearance to the robot's other stones (circle
-        bounds of half their length). A stone is dropped 1 cm above the highest of five ground samples under it, so
-        it settles onto the bumps.
+        heading below 0.2 m/s), clamped to the tile grid; each stone takes the one with the most clearance to the
+        robot's other stones (circle bounds of half their length). A stone is dropped 1 cm above the highest of five
+        ground samples under it, so it settles onto the bumps.
         """
         cfg, dev = self.world.rocks, self.device
         data = self.rocks.data
@@ -300,12 +300,15 @@ class terrain_step(ManagerTermBase):
         direction = torch.where(vel.norm(dim=-1) > 0.2, torch.atan2(vel[:, 1], vel[:, 0]), heading)
         xy = pose[..., :2]
         rows = torch.arange(n, device=dev)
+        extent = self.map.size * torch.tensor([self.map.num_rows, self.map.num_cols], device=dev)
+        grid_min, grid_max = self.map.corner + 0.3, self.map.corner + extent - 0.3
         for j in range(k):
             if not far[:, j].any():
                 continue
             angle = direction[:, None] + cfg.sector * (2 * torch.rand(n, cfg.candidates, device=dev) - 1)
             radius = cfg.ahead[0] + (cfg.ahead[1] - cfg.ahead[0]) * torch.rand(n, cfg.candidates, device=dev)
             spots = base[:, None] + radius[..., None] * torch.stack([angle.cos(), angle.sin()], -1)  # (N, C, 2)
+            spots = torch.maximum(torch.minimum(spots, grid_max), grid_min)
             clear = (spots[:, :, None] - xy[:, None]).norm(dim=-1) - (self._rock_sizes[j] + self._rock_sizes) / 2
             clear[..., j] = float("inf")
             best = spots[rows, clear.min(-1).values.argmax(-1)]

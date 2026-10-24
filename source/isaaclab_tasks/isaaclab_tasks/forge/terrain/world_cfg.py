@@ -126,9 +126,10 @@ class RockCfg:
     into its view.
     """
 
-    dynamic_rocks: int = 12
-    """Stones per robot. 1500 rocks in total (16 per robot) cut the real-time factor to 42 % of the rock-free
-    world, 4 kept 77-79 %."""
+    dynamic_rocks: int = 8
+    """Stones per robot. Measured on ``gravel_field`` with 100 robots (RTX 4090): real-time factor 3.44 without
+    stones, 0.91 with 8, 0.76 with 12, 0.57 with 16. A stone collides with every height-field cell under it, so
+    large flat stones cost far more than the earlier small rocks."""
     size: tuple[float, float] = (0.10, 0.45)
     """Length [m] of the stones: log-uniform and stratified, so the stones of a robot always run from kickable ones
     to slabs it can stand on. Shapes (mostly flat) come from the ``gravel_field`` template's knobs."""
@@ -240,10 +241,11 @@ class TerrainWorldCfg:
         lo, hi, k = self.rocks.size[0], self.rocks.size[1], self.rocks.dynamic_rocks
         specs = []
         for i in range(k):
+            size = float(lo * (hi / lo) ** ((i + rng.uniform()) / k))
             specs.append({
                 "template": i % template.template_count,
-                "size": float(lo * (hi / lo) ** ((i + rng.uniform()) / k)),
-                "axis_ratio": stone_shape(rng, template),
+                "size": size,
+                "axis_ratio": stone_shape(rng, template, size),
                 "density": float(rng.uniform(*self.rocks.density)),
                 "friction": float(rng.uniform(*self.rocks.friction)),
             })  # fmt: skip
