@@ -95,6 +95,7 @@ masks["B_value_drop"]  # [T] bool; the last frame is the event step
 | Collection (under `logs/fault_analysis/`) | Setup | Content |
 | --- | --- | --- |
 | `a2_study_robust_teacher/2026-10-24_rough_terminal` | A2 robust teacher `model_2999`, `--sub_terrains hills rough_discrete`, 4096 robots, `--terminal_only` | 300 failures in 460 s sim (523 robot-h, ≈0.57 failures per robot-h, 7 min wall); videos of the first 10 full-window events |
+| `harsh_world/v5_robust_full_40` | A2 robust teacher `model_2999`, `IsaacContrib-Velocity-A2HarshWorld-Robust-Full` (10 properties × 3 difficulties), 40 robots (4 per property; row d = 0.4 gets 2, the others 1), 30 min sim | 6136 events: 645 failures (606 tilt, 39 base contact) and 5491 leg-contact onsets, 22 min wall. 95 % of the failures on `slip_slope` 229, `mesa_drop` 216, `rough_slope` 168; none on `stub_field`, `crust_collapse`. Flagged with its own baseline |
 | `smoke/rough2` | same terrain, 1024 robots, 30 s, contact onsets too | 3418 leg-contact onsets and 6 failures; videos of events 100, 500 (contact) and 1264, 1291, 1788 (failures) |
 | `smoke/collect` | first version (reset on contact), all terrains | superseded; kept only as the evidence for the redesign |
 

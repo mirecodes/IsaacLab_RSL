@@ -3,10 +3,11 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""The Harsh World's runtime interaction layer, as one event term run every policy step.
+"""The terrain's runtime physics, as one event term run every policy step.
 
 Newton (MuJoCo-Warp) only: shape properties are written into the Newton model, see ``REPORT.md`` for how each
-spec item maps onto MuJoCo's contact model.
+interaction maps onto MuJoCo's contact model. Only the parts the terrain type needs run: slip on ``slip`` terrain,
+sand drag where there are sand patches, collapse where there are crusts, rock upkeep where there are dynamic rocks.
 """
 
 from __future__ import annotations
@@ -19,32 +20,34 @@ import warp as wp
 
 from isaaclab.managers import EventTermCfg, ManagerTermBase, SceneEntityCfg
 
+from ..templates.common import ZONES
+
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation, RigidObjectCollection
     from isaaclab.envs import ManagerBasedEnv
 
-    from ..harsh_world_cfg import HarshWorldCfg
-    from .world import ZoneMap
+    from ..world_cfg import TerrainWorldCfg
+    from .generator import TerrainMap
 
-SLIP, SAND = 1, 2
+SLIP = ZONES.index("slip")
+EVENT = "terrain"
+"""Name of the event term in the env cfg (the policy's privileged friction input reads :attr:`foot_friction`)."""
 
 
 def interp(pair: tuple[float, float], difficulty: torch.Tensor) -> torch.Tensor:
     return pair[0] + difficulty * (pair[1] - pair[0])
 
 
-class harsh_world_step(ManagerTermBase):
-    """Zone lookups and the zone interactions: slip friction, sand drag, crust collapse, rock upkeep.
+class terrain_step(ManagerTermBase):
+    """Slip friction, sand drag, crust collapse, and rock upkeep of the terrain map.
 
     Run as an ``interval`` event every step (``interval_range_s=(0, 0)``, global time) and on resets via
     :meth:`reset`. At construction it sets the static contact parameters: terrain friction, sand-slab stiffness
     and priority, foot shapes in force-space contact mode, rock friction.
 
-    Attributes read by the observations (``mdp.observations``):
-
-    * :attr:`foot_friction`: what the policy's privileged friction input reports, (N, 4).
-    * :attr:`foot_mu`: friction applied to each foot, (N, 4); :attr:`low_mu`: a slip sample is active.
-    * :attr:`collapse_event`: a foot's patch collapsed in the last step, (N, 4).
+    State, per foot (N, 4): :attr:`foot_friction` (what the policy's privileged friction input reports),
+    :attr:`foot_mu` (friction applied), :attr:`low_mu` (a slip sample is active), :attr:`in_sand`,
+    :attr:`collapse_event` (the foot's patch collapsed in the last step).
     """
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv) -> None:
@@ -52,9 +55,9 @@ class harsh_world_step(ManagerTermBase):
         from newton._src.solvers.mujoco.constants import SOLREF_MODE_FORCE_SPACE  # noqa: PLC0415
 
         super().__init__(cfg, env)
-        hw: HarshWorldCfg = cfg.params["world"]
-        self.hw = hw
-        self.zones: ZoneMap = env.scene.terrain.zone_map
+        world: TerrainWorldCfg = cfg.params["world"]
+        self.world = world
+        self.map: TerrainMap = env.scene.terrain.terrain_map
         asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
         self.robot: Articulation = env.scene[asset_cfg.name]
         self.foot_ids = asset_cfg.body_ids
@@ -66,7 +69,7 @@ class harsh_world_step(ManagerTermBase):
         # -- Newton model handles
         root_view = getattr(self.robot, "_root_view", None)
         if root_view is None or not hasattr(root_view, "body_shapes"):
-            raise RuntimeError("The Harsh World requires the Newton physics backend.")
+            raise RuntimeError("The terrain's runtime physics requires the Newton physics backend.")
         self._newton = env.sim.backend_manager
         self._shape_change = ModelFlags.SHAPE_PROPERTIES
         model = self._newton.get_model()
@@ -85,11 +88,11 @@ class harsh_world_step(ManagerTermBase):
         mode = wp.to_torch(model.mujoco.solref_mode)
         priority = model.mujoco.geom_priority.numpy()
         terrain_path = env.scene.terrain.cfg.prim_path
-        patch_re = re.compile(rf"^{re.escape(terrain_path)}/sand/cell_(\d+)_(\d+)/patch_(\d+)/")
-        patch_ids = {(p["row"], p["col"], p["index"]): p["id"] for p in self.zones.patches}
+        patch_re = re.compile(rf"^{re.escape(terrain_path)}/sand/tile_(\d+)_(\d+)/patch_(\d+)/")
+        patch_ids = {(p["row"], p["col"], p["index"]): p["id"] for p in self.map.patches}
         foot_names = [self.robot.body_names[i] for i in self.foot_ids]
-        rock_specs = hw.dynamic_rock_specs()
-        self.slab_shape = torch.full((len(self.zones.patches),), -1, dtype=torch.long)
+        rock_specs = world.dynamic_rock_specs()
+        self.slab_shape = torch.full((len(self.map.patches),), -1, dtype=torch.long)
         ground, foot = [], []
         for i, label in enumerate(labels):
             if body[i] >= 0:
@@ -99,8 +102,8 @@ class harsh_world_step(ManagerTermBase):
                 rock = re.search(r"/Rock_(\d+)", label)
                 if rock:
                     mu[i] = rock_specs[int(rock.group(1))]["friction"]
-                    mu_torsional[i] = hw.rocks.torsional_friction
-                    mu_rolling[i] = hw.rocks.rolling_friction
+                    mu_torsional[i] = world.rocks.torsional_friction
+                    mu_rolling[i] = world.rocks.rolling_friction
                 continue
             match = patch_re.match(label + "/")
             if match:
@@ -111,17 +114,17 @@ class harsh_world_step(ManagerTermBase):
                 mu[i] = 0.7  # static rocks: about the middle of the dynamic rocks' friction range
             else:
                 ground.append(i)
-        mu[ground] = hw.slip.ground_mu
+        mu[ground] = world.slip.ground_mu
         if (self.slab_shape < 0).any():
             raise RuntimeError("Some sand slabs were not found among the Newton shapes.")
         # slabs: compliant contact in Newton's force space (stiffness [N/m]), with priority over the feet
-        crust = torch.tensor([p["crust"] for p in self.zones.patches], dtype=torch.bool)
-        self.slab_ke = torch.tensor([p["stiffness"] for p in self.zones.patches], dtype=torch.float32)
-        self.slab_ke[crust] = hw.collapse.crust_stiffness
+        crust = torch.tensor([p["crust"] for p in self.map.patches], dtype=torch.bool)
+        self.slab_ke = torch.tensor([p["stiffness"] for p in self.map.patches], dtype=torch.float32)
+        self.slab_ke[crust] = world.collapse.crust_stiffness
         slabs = self.slab_shape.to(mu.device)
-        mu[slabs] = hw.sand.friction
+        mu[slabs] = world.sand.friction
         ke[slabs] = self.slab_ke.to(ke.device)
-        kd[slabs] = hw.sand.damping_ratio * self.slab_ke.to(kd.device)
+        kd[slabs] = world.sand.damping_ratio * self.slab_ke.to(kd.device)
         mode[slabs] = SOLREF_MODE_FORCE_SPACE
         mode[torch.tensor(foot, dtype=torch.long, device=mode.device)] = SOLREF_MODE_FORCE_SPACE
         self._newton.add_model_change(self._shape_change)
@@ -130,7 +133,7 @@ class harsh_world_step(ManagerTermBase):
 
         # -- state
         dev = env.device
-        nominal = hw.slip.mu_nominal
+        nominal = world.slip.mu_nominal
         self.foot_mu = torch.full((n, f), nominal, device=dev)
         self.foot_friction = self.foot_mu.clone()
         self.low_mu = torch.zeros(n, f, dtype=torch.bool, device=dev)
@@ -139,18 +142,15 @@ class harsh_world_step(ManagerTermBase):
         self.collapse_event = torch.zeros(n, f, dtype=torch.bool, device=dev)
         # crust / collapsed flags per patch, plus a trailing "no patch" entry so that patch id -1 indexes safely
         self.crust = torch.cat([crust, torch.zeros(1, dtype=torch.bool)]).to(dev)
-        self.collapsed = torch.zeros(len(self.zones.patches) + 1, dtype=torch.bool, device=dev)
-        self._collapse_time = torch.zeros(len(self.zones.patches) + 1, device=dev)
+        self.collapsed = torch.zeros(len(self.map.patches) + 1, dtype=torch.bool, device=dev)
+        self._collapse_time = torch.zeros(len(self.map.patches) + 1, device=dev)
         self.num_collapses = 0
-        difficulty = [self.zones.difficulty[p["row"], p["col"]].item() for p in self.zones.patches]
+        difficulty = [self.map.difficulty[p["row"], p["col"]].item() for p in self.map.patches]
         self._patch_difficulty = torch.tensor(difficulty + [0.0], device=dev)
         self._forces = torch.zeros(n, f, 3, device=dev)
         self._rocks_placed = False
         self._last_rock_reset = 0.0
         self.rocks: RigidObjectCollection | None = env.scene.rigid_object_collections.get("rocks")
-        self.rock_sizes = torch.tensor([s["size"] for s in rock_specs], device=dev)
-        self.labels: dict[str, torch.Tensor] = {}
-        """Position-based zone labels of the current step, computed by ``observations.refresh``."""
         self._write_foot_mu(torch.arange(n, device=dev))
 
     def _write_foot_mu(self, env_ids: torch.Tensor) -> None:
@@ -167,8 +167,8 @@ class harsh_world_step(ManagerTermBase):
         if env_ids is None or isinstance(env_ids, slice):
             env_ids = torch.arange(self.num_envs, device=self.device)
         env_ids = env_ids.to(self.device, dtype=torch.long)
-        self.foot_mu[env_ids] = self.hw.slip.mu_nominal
-        self.foot_friction[env_ids] = self.hw.slip.mu_nominal
+        self.foot_mu[env_ids] = self.world.slip.mu_nominal
+        self.foot_friction[env_ids] = self.world.slip.mu_nominal
         self.low_mu[env_ids] = False
         self._in_slip[env_ids] = False
         self.in_sand[env_ids] = False
@@ -182,23 +182,24 @@ class harsh_world_step(ManagerTermBase):
 
     def __call__(self, env: ManagerBasedEnv, env_ids, world, asset_cfg, sensor_cfg) -> None:
         pos = self.robot.data.body_link_pos_w.torch[:, self.foot_ids]
-        vel = self.robot.data.body_com_lin_vel_w.torch[:, self.foot_ids]
-        zone = self.zones.lookup(pos[..., :2])
-        self._slip(env, zone)
-        patch, surface = self.zones.patch(pos[..., :2])
-        self._collapse(env, patch, self.contact.data.net_forces_w.torch[:, self.contact_foot_ids, 2].abs())
-        self._sand(zone, patch, surface, pos, vel)
+        if self.map.zone == SLIP:
+            self._slip(env, *self.map.lookup(pos[..., :2]))
+        if self.map.patches:
+            patch, surface = self.map.patch(pos[..., :2])
+            self._collapse(env, patch, self.contact.data.net_forces_w.torch[:, self.contact_foot_ids, 2].abs())
+            vel = self.robot.data.body_com_lin_vel_w.torch[:, self.foot_ids]
+            self._sand(self.map.lookup(pos[..., :2])[1], patch, surface, pos, vel)
         if self.rocks is not None:
             now = env.common_step_counter * env.step_dt
-            if now - self._last_rock_reset >= self.hw.rocks.reset_interval:
+            if now - self._last_rock_reset >= self.world.rocks.reset_interval:
                 self._last_rock_reset = now
                 self.return_rocks(torch.arange(self.num_envs, device=self.device), only_drifted=True)
 
     # -- slip
 
-    def _slip(self, env: ManagerBasedEnv, zone: dict) -> None:
-        cfg = self.hw.slip
-        in_slip = zone["zone"] == SLIP
+    def _slip(self, env: ManagerBasedEnv, in_slip: torch.Tensor, difficulty: torch.Tensor) -> None:
+        """``in_slip``: foot on the slip terrain (the tile grid), ``difficulty``: its tile's difficulty (N, F)."""
+        cfg = self.world.slip
         enter = in_slip & ~self._in_slip
         if cfg.resample_on_touchdown:
             touchdown = self.contact.compute_first_contact(env.step_dt).torch[:, self.contact_foot_ids].bool()
@@ -207,9 +208,8 @@ class harsh_world_step(ManagerTermBase):
         self._in_slip = in_slip
         if not (enter.any() or leave.any()):
             return
-        d = zone["difficulty"]
-        lo = interp((cfg.mu_slip_easy[0], cfg.mu_slip_hard[0]), d)
-        hi = interp((cfg.mu_slip_easy[1], cfg.mu_slip_hard[1]), d)
+        lo = interp((cfg.mu_slip_easy[0], cfg.mu_slip_hard[0]), difficulty)
+        hi = interp((cfg.mu_slip_easy[1], cfg.mu_slip_hard[1]), difficulty)
         sample = lo + torch.rand_like(lo) * (hi - lo)
         low = torch.rand_like(lo) < cfg.slip_prob
         self.foot_mu = torch.where(enter, torch.where(low, sample, cfg.mu_nominal), self.foot_mu)
@@ -222,15 +222,14 @@ class harsh_world_step(ManagerTermBase):
 
     # -- sand
 
-    def _sand(self, zone: dict, patch: torch.Tensor, surface: torch.Tensor, pos, vel) -> None:
-        cfg = self.hw.sand
+    def _sand(self, difficulty: torch.Tensor, patch: torch.Tensor, surface: torch.Tensor, pos, vel) -> None:
+        cfg = self.world.sand
         # intact crusts are hard; sand drag acts in ordinary patches and in collapsed crusts
         soft = (patch >= 0) & (~self.crust[patch] | self.collapsed[patch])
-        self.in_sand = (zone["zone"] == SAND) & soft & (pos[..., 2] < surface + cfg.foot_radius)
-        d = zone["difficulty"]
+        self.in_sand = soft & (pos[..., 2] < surface + cfg.foot_radius)
         force = torch.zeros_like(vel)
-        force[..., :2] = -interp(cfg.c_drag, d)[..., None] * vel[..., :2]
-        force[..., 2] = -interp(cfg.c_suction, d) * vel[..., 2].clamp(min=0.0)
+        force[..., :2] = -interp(cfg.c_drag, difficulty)[..., None] * vel[..., :2]
+        force[..., 2] = -interp(cfg.c_suction, difficulty) * vel[..., 2].clamp(min=0.0)
         norm = force.norm(dim=-1, keepdim=True)
         force = torch.where(norm > cfg.force_limit, force * cfg.force_limit / norm.clamp(min=1e-6), force)
         force[~self.in_sand] = 0.0
@@ -249,7 +248,7 @@ class harsh_world_step(ManagerTermBase):
 
     def _collapse(self, env: ManagerBasedEnv, patch: torch.Tensor, force: torch.Tensor) -> None:
         """``patch``: patch id under each foot (N, F); ``force``: vertical contact force of each foot (N, F)."""
-        cfg = self.hw.collapse
+        cfg = self.world.collapse
         self.collapse_event[:] = False
         if not cfg.enabled or not self.crust.any():
             return
@@ -257,8 +256,8 @@ class harsh_world_step(ManagerTermBase):
         recovered = self.collapsed & (now - self._collapse_time >= cfg.recover_time)
         # load of each robot on each crust patch: the summed vertical force of its feet standing on it
         on_crust = self.crust[patch]
-        load = torch.zeros(self.num_envs, len(self.zones.patches) + 1, device=self.device)
-        load.scatter_add_(1, torch.where(on_crust, patch, len(self.zones.patches)), force * on_crust)
+        load = torch.zeros(self.num_envs, len(self.map.patches) + 1, device=self.device)
+        load.scatter_add_(1, torch.where(on_crust, patch, len(self.map.patches)), force * on_crust)
         limit = interp(cfg.collapse_force, self._patch_difficulty)
         new = (load > limit).any(dim=0) & self.crust & ~self.collapsed
         if not (new.any() or recovered.any()):
@@ -272,14 +271,15 @@ class harsh_world_step(ManagerTermBase):
         ke = self.slab_ke[changed] * torch.where(self.collapsed[:-1].cpu()[changed], scale, 1.0)
         shapes = self.slab_shape[changed].to(self._ke.device)
         self._ke[shapes] = ke.to(self._ke.device)
-        self._kd[shapes] = self.hw.sand.damping_ratio * ke.to(self._kd.device)
+        self._kd[shapes] = self.world.sand.damping_ratio * ke.to(self._kd.device)
         self._newton.add_model_change(self._shape_change)
 
     # -- rocks
 
     def return_rocks(self, env_ids: torch.Tensor, only_drifted: bool) -> int:
-        """Move rocks back to their row's slots (all of them, or only those beyond ``drift_max``)."""
-        slots = self.zones.rock_slots[self._env.scene.terrain.terrain_levels[env_ids]]  # (E, K, 4)
+        """Move rocks back to their tile's slots (all of them, or only those beyond ``drift_max``)."""
+        terrain = self._env.scene.terrain
+        slots = self.map.rock_slots[terrain.terrain_levels[env_ids], terrain.terrain_types[env_ids]]  # (E, K, 4)
         k = slots.shape[1]
         # rock meshes have their bottom at the body origin; drop them from 2 cm above the ground
         target = torch.cat([slots[..., :2], (slots[..., 2] + 0.02)[..., None]], dim=-1)
@@ -287,7 +287,7 @@ class harsh_world_step(ManagerTermBase):
         quat = torch.stack([torch.zeros_like(yaw), torch.zeros_like(yaw), torch.sin(yaw / 2), torch.cos(yaw / 2)], -1)
         pose = torch.cat([target, quat], dim=-1)
         current = self.rocks.data.body_link_pose_w.torch[env_ids, :k]
-        move = (current[..., :3] - target).norm(dim=-1) > self.hw.rocks.drift_max if only_drifted else None
+        move = (current[..., :3] - target).norm(dim=-1) > self.world.rocks.drift_max if only_drifted else None
         if move is not None:
             pose = torch.where(move[..., None], pose, current)
         velocity = self.rocks.data.body_com_vel_w.torch[env_ids, :k].clone()

@@ -14,6 +14,8 @@ forge/
       agents/rsl_rl_ppo_cfg.py
       mdp/                     this task's own terms
       REPORT.md
+  terrain/                     terrain-generation templates (templates/<type>.py) and play tasks
+                               IsaacContrib-Terrain-<Type>-<Policy>; add a terrain type there, see its REPORT.md
 ```
 
 ## Workflow

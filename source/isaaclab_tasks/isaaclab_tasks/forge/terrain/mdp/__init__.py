@@ -3,4 +3,4 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Harsh World terms: property height fields, the world generator/importer, runtime zone events, and labels."""
+"""Terrain-map terms: the grid generator and importer, and the runtime physics event."""
