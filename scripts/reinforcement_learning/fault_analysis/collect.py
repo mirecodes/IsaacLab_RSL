@@ -5,12 +5,15 @@
 
 """Play a trained RSL-RL locomotion policy on many robots and save the seconds before every failure.
 
-A failure is any contact on a non-foot body (base, hip, thigh, calf). It replaces the task's terminations
-(only time-outs are kept), so the robot is reset right after the failure. Every robot keeps a ring buffer of
-the last ``--buffer_s`` seconds of its state; on a failure the buffer is written to ``events/<id>.npz``
-and indexed in ``index.csv``. See ``README.md`` next to this file for the data layout.
+Every robot keeps a ring buffer of the last ``--buffer_s`` seconds of its state. An event saves that buffer to
+``events/<id>.npz`` and indexes it in ``index.csv``. Events are:
 
-Runs headless until ``--max_events`` failures or ``--max_steps`` env steps, e.g. on Euler::
+* the onset of contact on a non-foot body (base, hip, thigh, calf), after a ``--grace_s`` spawn grace and at most
+  once per robot per buffer length; the robot keeps walking;
+* a task termination other than a time-out (e.g. base contact, large tilt), always; the robot is reset.
+
+See ``README.md`` next to this file for the data layout. Runs headless until ``--max_events`` events or
+``--max_steps`` env steps, e.g. on Euler::
 
     euler enqueue fault_a2_robust -- python scripts/reinforcement_learning/fault_analysis/collect.py \\
         --task IsaacContrib-Velocity-A2Study-RobustTeacher \\
@@ -38,8 +41,7 @@ from rsl_rl.runners import DistillationRunner, OnPolicyRunner  # noqa: E402
 from tensordict import TensorDict  # noqa: E402
 
 from isaaclab.app import launch_simulation  # noqa: E402
-from isaaclab.managers import RecorderTerm, RecorderTermCfg, SceneEntityCfg  # noqa: E402
-from isaaclab.managers import TerminationTermCfg as DoneTerm  # noqa: E402
+from isaaclab.managers import RecorderTerm, RecorderTermCfg  # noqa: E402
 from isaaclab.managers.recorder_manager import DatasetExportMode, RecorderManagerBaseCfg  # noqa: E402
 from isaaclab.utils import configclass, to_dict  # noqa: E402
 from isaaclab.utils.io import dump_yaml  # noqa: E402
@@ -49,17 +51,15 @@ from isaaclab_rl.entrypoints.backends.play_rsl_rl import _parse_args, _resolve_c
 from isaaclab_rl.entrypoints.common import apply_env_overrides, close_env, create_isaaclab_env  # noqa: E402
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper  # noqa: E402
 
-from isaaclab_tasks.core.velocity import mdp  # noqa: E402
 from isaaclab_tasks.utils import resolve_task_config  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 RUNNERS = {"OnPolicyRunner": OnPolicyRunner, "DistillationRunner": DistillationRunner}
-FAULT_TERM = "fault_contact"
 
 
 class FaultRecorder(RecorderTerm):
-    """Keeps the last ``buffer_s`` seconds of every robot on the GPU and saves them when ``FAULT_TERM`` fires.
+    """Keeps the last ``buffer_s`` seconds of every robot on the GPU and saves them on events (see module doc).
 
     Frame ``t`` is sampled at the end of env step ``t``, before resets: the state ``s_t``, the observation
     ``o_t`` computed from it, the critic value ``V(o_t)``, and the action ``a_{t-1}`` that led to ``s_t``.
@@ -75,15 +75,19 @@ class FaultRecorder(RecorderTerm):
         self.value_fn = None
         """Critic ``obs_buf -> V`` [num_envs]; set by the script once the policy is loaded."""
         self.num_events = 0
+        self.num_terminal = 0
         self._buffers: dict[str, torch.Tensor] | None = None
         self._ptr = 0
+        self.grace_frames = round(cfg.grace_s / env.step_dt)
         self._length = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        self._since_event = torch.full_like(self._length, self.num_frames)
+        self._in_contact = torch.zeros(env.num_envs, len(self.trigger_ids), dtype=torch.bool, device=env.device)
         os.makedirs(os.path.join(cfg.output_dir, "events"), exist_ok=True)
         self._index_path = os.path.join(cfg.output_dir, "index.csv")
         with open(self._index_path, "w", newline="") as f:
             csv.writer(f).writerow(
                 ["event", "env_id", "step", "sim_time_s", "episode_step", "num_frames", "terrain_level",
-                 "terrain_type", "base_contact", "trigger_bodies"]
+                 "terrain_type", "terminal", "terminations", "base_contact", "contact_bodies"]
             )  # fmt: skip
 
     def sample(self) -> dict[str, torch.Tensor]:
@@ -141,42 +145,58 @@ class FaultRecorder(RecorderTerm):
         return frame
 
     def record_post_step(self):
+        env = self._env
         frame = self.sample()
         if self._buffers is None:
-            n = (self._env.num_envs, self.num_frames)
+            n = (env.num_envs, self.num_frames)
             self._buffers = {k: torch.zeros(n + v.shape[1:], dtype=v.dtype, device=v.device) for k, v in frame.items()}
         for key, value in frame.items():
             self._buffers[key][:, self._ptr] = value
         self._ptr = (self._ptr + 1) % self.num_frames
         self._length += 1
+        self._since_event += 1
+        # non-foot contact over the sensor history, as in mdp.illegal_contact
+        history = self.contact.data.net_normal_forces_w_history.torch[:, :, self.trigger_ids]
+        in_contact = history.norm(dim=-1).amax(dim=1) > self.cfg.threshold
+        onset = (in_contact & ~self._in_contact).any(dim=1)
+        self._in_contact = in_contact
+        # reset_terminated excludes time-outs; it is computed before this hook within env.step
+        save = env.reset_terminated.clone()
+        if not self.cfg.terminal_only:
+            save |= onset & (self._length > self.grace_frames) & (self._since_event >= self.num_frames)
+        ids = save.nonzero().squeeze(-1)
+        if len(ids) > 0:
+            self._save(ids, in_contact[ids])
+            self._since_event[ids] = 0
         return None, None
 
     def record_pre_reset(self, env_ids):
         ids = torch.as_tensor(env_ids, dtype=torch.long, device=self._env.device)
-        if self._buffers is not None:
-            failed = self._env.termination_manager.get_term(FAULT_TERM)[ids] & (self._length[ids] > 0)
-            if failed.any():
-                self._save(ids[failed])
         self._length[ids] = 0
+        self._since_event[ids] = self.num_frames
         return None, None
 
-    def _save(self, ids: torch.Tensor) -> None:
+    def _save(self, ids: torch.Tensor, in_contact: torch.Tensor) -> None:
         env = self._env
+        manager = env.termination_manager
         # oldest -> newest; _ptr is the next slot to write, i.e. the oldest frame
         order = (torch.arange(self.num_frames, device=env.device) + self._ptr) % self.num_frames
         data = {k: v[ids][:, order].cpu().numpy() for k, v in self._buffers.items()}
         lengths = self._length[ids].clamp(max=self.num_frames).tolist()
-        # bodies that fired the trigger, over the sensor history like mdp.illegal_contact
-        history = self.contact.data.net_normal_forces_w_history.torch[ids]
-        forces = history[:, :, self.trigger_ids].norm(dim=-1).amax(dim=1)
-        touched = (forces > self.cfg.threshold).cpu().numpy()
+        in_contact = in_contact.cpu().numpy()
+        failures = {
+            name: manager.get_term(name)[ids].cpu().numpy()
+            for name in manager.active_terms
+            if not manager.get_term_cfg(name).time_out
+        }
         terrain = env.scene.terrain
         levels = getattr(terrain, "terrain_levels", None)
         types = getattr(terrain, "terrain_types", None)
         rows = []
         for i, env_id in enumerate(ids.tolist()):
             n = lengths[i]
-            names = [name for name, hit in zip(self.trigger_names, touched[i]) if hit]
+            bodies = [name for name, hit in zip(self.trigger_names, in_contact[i]) if hit]
+            terminations = [name for name, hit in failures.items() if hit[i]]
             level = int(levels[env_id]) if levels is not None else -1
             col = int(types[env_id]) if types is not None else -1
             np.savez_compressed(
@@ -187,13 +207,16 @@ class FaultRecorder(RecorderTerm):
                 env_origin=terrain.env_origins[env_id].cpu().numpy(),
                 terrain_level=level,
                 terrain_type=col,
-                trigger_bodies=np.array(names),
+                terminations=np.array(terminations),
+                contact_bodies=np.array(bodies),
             )
             rows.append(
                 [self.num_events, env_id, env.common_step_counter, f"{env.common_step_counter * env.step_dt:.2f}",
-                 int(env.episode_length_buf[env_id]), n, level, col, self.robot.body_names[0] in names, "|".join(names)]
+                 int(env.episode_length_buf[env_id]), n, level, col, bool(terminations), "|".join(terminations),
+                 self.robot.body_names[0] in bodies, "|".join(bodies)]
             )  # fmt: skip
             self.num_events += 1
+            self.num_terminal += bool(terminations)
         with open(self._index_path, "a", newline="") as f:
             csv.writer(f).writerows(rows)
 
@@ -205,6 +228,8 @@ class FaultRecorderCfg(RecorderTermCfg):
     buffer_s: float = 5.0
     trigger_bodies: str = ""
     threshold: float = 1.0
+    grace_s: float = 1.0
+    terminal_only: bool = False
 
 
 @configclass
@@ -216,23 +241,7 @@ class FaultRecorderManagerCfg(RecorderManagerBaseCfg):
 
 
 def configure_env(env_cfg, fault_args: argparse.Namespace, output_dir: str) -> None:
-    """Training env with every robot on a fixed tile, the fault trigger as the only failure, and the recorder."""
-    # failures: non-foot contact only; keep time-outs
-    for name, term in list(env_cfg.terminations.__dict__.items()):
-        if term is not None and not term.time_out:
-            setattr(env_cfg.terminations, name, None)
-    trigger_bodies = f"(?!{fault_args.foot_bodies}$).*"
-    setattr(
-        env_cfg.terminations,
-        FAULT_TERM,
-        DoneTerm(
-            func=mdp.illegal_contact,
-            params={
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=trigger_bodies),
-                "threshold": fault_args.contact_threshold,
-            },
-        ),
-    )
+    """Training env (own terminations) on a fixed terrain, without disturbances, with the fault recorder."""
     configure_terrain(env_cfg, env_cfg.seed, fault_args.sub_terrains)
     # disturbances: off unless asked for, so failures come from policy and terrain
     if not fault_args.disturbances:
@@ -243,8 +252,10 @@ def configure_env(env_cfg, fault_args: argparse.Namespace, output_dir: str) -> N
         fault=FaultRecorderCfg(
             output_dir=output_dir,
             buffer_s=fault_args.buffer_s,
-            trigger_bodies=trigger_bodies,
+            trigger_bodies=f"(?!{fault_args.foot_bodies}$).*",
             threshold=fault_args.contact_threshold,
+            grace_s=fault_args.grace_s,
+            terminal_only=fault_args.terminal_only,
         )
     )
 
@@ -324,10 +335,12 @@ def write_metadata(env, recorder: FaultRecorder, output_dir: str, info: dict) ->
 def main() -> None:
     parser = argparse.ArgumentParser(description="Collect the motion before failures of a trained policy.")
     parser.add_argument("--buffer_s", type=float, default=5.0, help="Seconds kept before each failure.")
-    parser.add_argument("--max_events", type=int, default=1000, help="Stop after this many failures.")
+    parser.add_argument("--max_events", type=int, default=1000, help="Stop after this many events.")
     parser.add_argument("--max_steps", type=int, default=None, help="Stop after this many env steps.")
     parser.add_argument("--foot_bodies", default=".*_foot", help="Regex of the foot bodies; all others trigger.")
     parser.add_argument("--contact_threshold", type=float, default=1.0, help="Trigger contact force [N].")
+    parser.add_argument("--grace_s", type=float, default=1.0, help="Ignore contact onsets this long after a reset.")
+    parser.add_argument("--terminal_only", action="store_true", help="Record only task terminations.")
     parser.add_argument("--disturbances", action="store_true", help="Keep the task's pushes and external wrench.")
     parser.add_argument("--sub_terrains", nargs="+", default=None, help="Keep only these sub-terrains.")
     parser.add_argument("--output_dir", default=None, help="Default: logs/fault_analysis/<experiment>/<time>_<run>.")
@@ -392,10 +405,15 @@ def main() -> None:
                         robot_h = sim_s * env.num_envs / 3600
                         print(
                             f"[fault] step {step} ({sim_s:.0f} s sim, {robot_h:.1f} robot-h, "
-                            f"{time.time() - start:.0f} s wall): {recorder.num_events} failures",
+                            f"{time.time() - start:.0f} s wall): {recorder.num_events} events "
+                            f"({recorder.num_terminal} terminal)",
                             flush=True,
                         )
-            print(f"[fault] done: {recorder.num_events} failures in {step} steps -> {output_dir}", flush=True)
+            print(
+                f"[fault] done: {recorder.num_events} events ({recorder.num_terminal} terminal) in {step} steps"
+                f" -> {output_dir}",
+                flush=True,
+            )
         finally:
             close_env(env)
 

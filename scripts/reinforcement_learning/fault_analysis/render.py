@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Render failure events saved by ``collect.py`` as videos that follow the robot over the terrain.
+"""Render events saved by ``collect.py`` as videos that follow the robot over the terrain.
 
 The motion is replayed kinematically: every frame writes the logged base pose and joint positions and renders
 without stepping physics. The terrain is regenerated from the task and seed in ``meta.json`` and checked
@@ -19,6 +19,7 @@ import warp as wp
 wp.config.enable_backward = False
 
 import argparse  # noqa: E402
+import csv  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 import sys  # noqa: E402
@@ -44,17 +45,22 @@ from isaaclab_tasks.utils import resolve_task_config  # noqa: E402
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Render failure events saved by collect.py.")
+    parser = argparse.ArgumentParser(description="Render events saved by collect.py.")
     parser.add_argument("collection", help="Collection directory written by collect.py.")
     parser.add_argument("--events", type=int, nargs="*", default=None, help="Event ids (default: all).")
-    parser.add_argument("--eye", type=float, nargs=3, default=(-2.0, -2.0, 1.2), help="Camera offset [m].")
+    parser.add_argument("--count", type=int, default=None, help="Without --events: the first N full-window events.")
+    parser.add_argument("--eye", type=float, nargs=3, default=(-1.0, -1.0, 0.6), help="Camera offset [m].")
     render_args, argv = parser.parse_known_args(sys.argv[1:])
     collection = os.path.abspath(render_args.collection)
     with open(os.path.join(collection, "meta.json")) as f:
         meta = json.load(f)
     events = render_args.events
     if events is None:
-        events = sorted(int(name[:-4]) for name in os.listdir(os.path.join(collection, "events")))
+        with open(os.path.join(collection, "index.csv")) as f:
+            rows = list(csv.DictReader(f))
+        if render_args.count is not None:
+            rows = [r for r in rows if int(r["num_frames"]) == meta["num_frames"]][: render_args.count]
+        events = [int(r["event"]) for r in rows]
 
     args_cli = _parse_args(["--task", meta["task"], "--num_envs", "1", "--seed", str(meta["seed"]), *argv])
     # a capture-capable visualizer (headless Newton GL unless --viz picks one)
@@ -65,6 +71,10 @@ def main() -> None:
         apply_env_overrides(args_cli, env_cfg)
         env_cfg.seed = meta["seed"]
         configure_terrain(env_cfg, meta["seed"], meta["args"].get("sub_terrains"))
+        # no command markers over the robot
+        for term in vars(env_cfg.commands).values():
+            if hasattr(term, "debug_vis"):
+                term.debug_vis = False
         env = create_isaaclab_env(args_cli.task, env_cfg, args_cli, convert_marl_to_single_agent=False).unwrapped
         try:
             saved = np.load(os.path.join(collection, "terrain.npz"))
@@ -99,7 +109,9 @@ def main() -> None:
                         time.sleep(meta["step_dt"])
                 path = os.path.join(collection, "videos", f"{event:06d}.mp4")
                 ImageSequenceClip(frames, fps=round(1.0 / meta["step_dt"])).write_videofile(path, logger=None)
-                print(f"[fault] {path} ({data['trigger_bodies']})", flush=True)
+                print(
+                    f"[fault] {path}: contact {data['contact_bodies']}, terminations {data['terminations']}", flush=True
+                )
         finally:
             close_env(env)
 
