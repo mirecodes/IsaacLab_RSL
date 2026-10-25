@@ -377,22 +377,25 @@ def probe_rocks(args, args_cli):
     target = robot.data.root_link_pos_w.torch.clone()
     target[0, 1] += 8.0
     target[0, 2] = tmap.height(target[:1, :2]).item() + 0.45
+    # the other robots' stones within recycle_radius stay; robot 0's all follow it
+    base = robot.data.root_link_pos_w.torch[:, None, :2]
     before = data.body_link_pos_w.torch.clone()
+    near = (before[..., :2] - base).norm(dim=-1) <= cfg.rocks.recycle_radius
     term._last_recycle = -float("inf")  # the event recycles in the next step
     place(robot, target)
     run(env, 2 * env.step_dt)
     after = data.body_link_pos_w.torch
-    count = int(((after - before).norm(dim=-1) > 0.5).sum())
+    count = int(((after[0] - before[0]).norm(dim=-1) > 0.5).sum())
     k = after.shape[1]
     dist = (after[0, :, :2] - robot.data.root_link_pos_w.torch[0, :2]).norm(dim=-1)
     gaps = (after[0, :, None, :2] - after[0, None, :, :2]).norm(dim=-1) - (term._rock_sizes[:, None] +
                                                                            term._rock_sizes) / 2  # fmt: skip
     gaps.fill_diagonal_(float("inf"))
-    still = (after[1:] - before[1:]).norm(dim=-1).max().item()
+    still = ((after[1:] - before[1:]).norm(dim=-1) * near[1:]).max().item()
     lo, hi = cfg.rocks.ahead
     check("T6", count == k and lo - 0.1 <= dist.min() and dist.max() <= hi + 0.1 and still < 0.01,
-          f"recycle moved {count} stones (robot 0's {k}) to {dist.min():.2f}-{dist.max():.2f} m from it, smallest gap "
-          f"{gaps.min():.2f} m; the other robots' stones moved {still * 1000:.1f} mm")  # fmt: skip
+          f"recycle moved robot 0's {count}/{k} stones to {dist.min():.2f}-{dist.max():.2f} m from it, smallest gap "
+          f"{gaps.min():.2f} m; the other robots' stones near them moved {still * 1000:.1f} mm")  # fmt: skip
     env.close()
 
 

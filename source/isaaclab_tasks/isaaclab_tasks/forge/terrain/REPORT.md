@@ -238,11 +238,13 @@ sand, collapse and rock code is unchanged (§5.2).
 | T2 | slab top vs hardpan ≤ 1 cm; patches ≥ 0.7 m apart | 0.63 cm (`sand_field`, 232 patches on 5 x 3 tiles), 0.63 cm (`crust_collapse`, 258 patches, 96 crusts) | pass |
 | T1 | generation of one 5 x 5 map | 14–16 s per type (Euler CPU) | pass |
 | T4 | spawn on the platform; no fall within 1 s (all 9 types) | 0 falls | pass |
-| T4 | real-time factor at 100 robots | rough_field 3.44, pit_field 3.54, stub_field 3.62, rough_slope 3.43, rough_stairs 3.39, slip_slope 2.66, sand_field 2.85, gravel_field 1.70, crust_collapse 2.70 | **fail** vs 5 x (as before) |
-| T6 | `gravel_field` moving-rock foot contacts ≥ 1 per minute | 83.0 per minute; a dynamic rock moves with no foot near it 0.61 % of the time | pass |
+| T4 | real-time factor at 100 robots | rough_field 3.44, pit_field 3.54, stub_field 3.62, rough_slope 3.43, rough_stairs 3.39, slip_slope 2.66, sand_field 2.85, gravel_field 0.94 (8 stones per robot; 12: 0.76, 16: 0.57), crust_collapse 2.70 | **fail** vs 5 x |
+| T6 | `gravel_field` (all-dynamic stones, 2026-10-25) moving-stone foot contacts ≥ 1 per minute | 5961 per minute (100 robots); a stone moves with no foot near it 2.3 % of the time (mostly the 1 cm drop after a recycle) | pass |
+| T6 | `gravel_field` stones at rest (8 robots x 8 stones, 10 s) | net speed ≤ 0.004 m/s, 0 below the terrain, 98.2 % of stone-steps at rest after 5 s | pass |
+| T6 | `gravel_field` recycle | robot 0 moved 8 m: its 8 stones land 1.45–2.95 m from it, ≥ 0.48 m apart; the other robots' nearby stones move 0.0 mm | pass |
 | T6 | stability: NaN, bodies > 20 m/s on `crust_collapse` (all types) | all smoke checks pass | pass |
 
-Terminations per minute: slip_slope 109, rough_stairs 47.5, rough_slope 31.5, gravel_field 14.5, rough_field 2.5,
+Terminations per minute: slip_slope 109, rough_stairs 47.5, rough_slope 31.5, gravel_field 3.0, rough_field 2.5,
 stub_field 2.0, sand_field 2.0, crust_collapse 2.0, pit_field 0. The one-direction slope ends fewer episodes than
 the old pyramid (119.5 at d 0.4–1.0) although its rows reach 45 deg: its first rows are gentle (0–22.5 deg), and
 two of five columns are plain. The patchwork sand (about 15 patches per tile instead of 7) costs no speed.
@@ -339,3 +341,9 @@ touched the stairs and slopes at the platform edge within 1 s); dynamic rocks 15
   `height_field_template` (extrapolated tile border), row lift and edge-following border in the generator,
   `slope_threshold=None`, per-template `difficulty_range`. Reason: realistic inclines a robot climbs or descends,
   realistic uneven ground, and sand patches that look natural. Verified on Euler (§5.1).
+- 2026-10-25: `gravel_field` stones all dynamic and mostly flat (the user's request): no static rocks, no boulder
+  quadrant; 8 stones per robot (10–45 cm, flat top and bottom faces, hulls scaled to their nominal box, stones above
+  20 cm always flat) that follow their robot (`recycle_*` in `RockCfg`), μ 0.8–1.0 and rolling / torsional friction
+  0.04 / 0.05 so they tilt and rock instead of sliding. Static rock spawning, rock slots and the map's `rocks` list
+  removed. Reason: stones to step on that wobble when loaded near an edge; a tile-wide field of dynamic stones would
+  cost its full count per robot (MuJoCo-Warp worlds). Verified on Euler (§5.1); the real-time factor drops to 0.94.

@@ -138,11 +138,12 @@ class RockCfg:
     friction: tuple[float, float] = (0.8, 1.0)
     """Stone friction, uniform per stone (it decides the stone-ground contact). High, so a stone stepped on near its
     edge tilts and rocks on its support rather than sliding away."""
-    torsional_friction: float = 0.03
-    rolling_friction: float = 0.02
+    torsional_friction: float = 0.05
+    rolling_friction: float = 0.04
     """MuJoCo torsional [m] and rolling [m] friction of the stones (``condim`` 6). Without sleeping, flat stones
-    resting on three bumps otherwise keep rocking at 1-3 cm/s (0.02 / 0.005: 88 % of stone-steps at rest). Under a
-    foot the rolling resistance stays small: 0.02 m x 150 N = 3 N m against about 20 N m from a foot near the edge."""
+    resting on three bumps otherwise keep rocking at 1-3 cm/s (0.02 / 0.005: 88 % of stone-steps at rest; 0.03 /
+    0.02: 95 %). Under a foot the rolling resistance stays small: 0.04 m x 150 N = 6 N m against about 20 N m from a
+    foot near the edge."""
     recycle_interval: float = 1.0
     """Seconds between moves of the stones left behind."""
     recycle_radius: float = 3.0

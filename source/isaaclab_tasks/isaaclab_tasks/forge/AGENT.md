@@ -16,6 +16,9 @@ forge/
       REPORT.md
   terrain/                     terrain-generation templates (templates/<type>.py) and play tasks
                                IsaacContrib-Terrain-<Type>-<Policy>; add a terrain type there, see its REPORT.md
+  fault_injector/              fault-injection templates (injector.py) that tasks add to their env cfg; see its README.md
+  fault_detector/<detector>/   data-collection tasks for fault detectors; the detectors train offline in
+                               scripts/forge/fault_detector
 ```
 
 ## Workflow
