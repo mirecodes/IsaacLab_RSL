@@ -347,7 +347,9 @@ def probe_rocks(args, args_cli):
     env = env.unwrapped
     env.reset()
     tmap, rocks, term = env.scene.terrain.terrain_map, env.scene["rocks"], term_of(env)
-    # the robots stand on their platforms (zero action); their stones lie 1.2-3 m around them
+    # the robots stand on their platforms (zero action); their stones lie 1.2-3 m around them. No recycling while
+    # the stones settle (a robot drifting on its platform would otherwise move some)
+    interval, term.world.rocks.recycle_interval = term.world.rocks.recycle_interval, float("inf")
     data = rocks.data
     speeds = []
     for i in range(round(10.0 / env.step_dt)):
@@ -369,17 +371,18 @@ def probe_rocks(args, args_cli):
           f">= 0.01 m/s; largest displacement over the last 5 s {moved:.1f} mm)")  # fmt: skip
     check("T6", sunk == 0, f"{sunk} stones below the terrain")
     check("T6", rest >= 0.95, f"{rest * 100:.1f} % of stone-steps at rest after 5 s (no sleeping in MuJoCo-Warp)")
+    term.world.rocks.recycle_interval = interval
     # recycle: move robot 0 by 8 m along the tile row; only its stones follow, to the ring ahead of it
     robot = env.scene["robot"]
     target = robot.data.root_link_pos_w.torch.clone()
     target[0, 1] += 8.0
     target[0, 2] = tmap.height(target[:1, :2]).item() + 0.45
-    place(robot, target)
-    run(env, env.step_dt)
     before = data.body_link_pos_w.torch.clone()
-    count = term.recycle_rocks()
-    run(env, env.step_dt)
+    term._last_recycle = -float("inf")  # the event recycles in the next step
+    place(robot, target)
+    run(env, 2 * env.step_dt)
     after = data.body_link_pos_w.torch
+    count = int(((after - before).norm(dim=-1) > 0.5).sum())
     k = after.shape[1]
     dist = (after[0, :, :2] - robot.data.root_link_pos_w.torch[0, :2]).norm(dim=-1)
     gaps = (after[0, :, None, :2] - after[0, None, :, :2]).norm(dim=-1) - (term._rock_sizes[:, None] +

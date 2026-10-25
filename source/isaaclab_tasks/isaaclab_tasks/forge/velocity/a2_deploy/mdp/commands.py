@@ -46,7 +46,8 @@ class SteeringCommand(UniformVelocityCommand):
         self.vel_command_b[env_ids, 0] = r.uniform_(*self.cfg.ranges.lin_vel_x)
         self.vel_command_b[env_ids, 1] = 0.0
         self.turn_left[env_ids] = r.uniform_(-self.cfg.max_turn, self.cfg.max_turn)
-        self.turning[env_ids] = True
+        # decided by the drawn turn, not by the first step's measured yaw (a slipping robot can spin > tol per step)
+        self.turning[env_ids] = self.turn_left[env_ids].abs() >= self.cfg.turn_tolerance
 
     def _update_command(self):
         dt = self._env.step_dt

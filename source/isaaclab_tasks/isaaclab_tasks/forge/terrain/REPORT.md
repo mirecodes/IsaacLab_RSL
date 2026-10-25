@@ -111,7 +111,9 @@ outer border (5 m) continues the height of each edge pixel outward instead of si
 **Renders.** One middle-difficulty tile (row 2 of 5: d = 0.7, for the inclines d = 0.5 = 22.5 deg) of each type,
 column 2 (a rough column for the inclines), seed 42, with the robust policy walking for 5 s, seen from the -x
 (downhill) side (Newton GL viewer, which draws the terrain blue and the sand slabs and rocks white; neighboring tiles
-of the same type show at the edges). Regenerate with `probe.py view` (`scripts/reinforcement_learning/terrain/README.md`).
+of the same type show at the edges); for `gravel_field` a robot close-up instead (the stones stay within 3 m of
+their robot; the viewer draws every robot's stones). Regenerate with `probe.py view`
+(`scripts/reinforcement_learning/terrain/README.md`).
 
 | `rough_field` (rigid) | `pit_field` (rigid) |
 | --- | --- |
