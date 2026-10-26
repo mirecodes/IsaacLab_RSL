@@ -3,7 +3,8 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Deployment play tasks ``IsaacContrib-Velocity-A2Deploy-<Type>-{Robust,Energy}`` on the terrain maps.
+"""Deployment play tasks ``IsaacContrib-Surveillance-<Type>-{Robust,Energy}`` on the terrain maps: the 9 types of
+``forge/terrain`` plus :data:`EXTRA_TERRAINS`, 20 tasks.
 
 Play-only: the runner configs are the trained tasks' own, so their checkpoints load unchanged. See ``REPORT.md``.
 """
@@ -12,10 +13,14 @@ import gymnasium as gym
 
 from isaaclab_tasks.forge.terrain import AGENTS, RUNNERS, TERRAINS
 
+EXTRA_TERRAINS = ("slip_field",)
+"""Terrain types this task adds to ``forge/terrain``'s catalog (``env_cfg.extra_templates``), listed here so that
+registration imports nothing."""
+
 
 def task_id(terrain: str, policy: str) -> str:
-    """``rough_field``, ``Robust`` -> ``IsaacContrib-Velocity-A2Deploy-RoughField-Robust``."""
-    return f"IsaacContrib-Velocity-A2Deploy-{terrain.title().replace('_', '')}-{policy}"
+    """``rough_field``, ``Robust`` -> ``IsaacContrib-Surveillance-RoughField-Robust``."""
+    return f"IsaacContrib-Surveillance-{terrain.title().replace('_', '')}-{policy}"
 
 
 def _env_cfg_entry_point(terrain: str, policy: str):
@@ -27,7 +32,7 @@ def _env_cfg_entry_point(terrain: str, policy: str):
     return make
 
 
-for _terrain in TERRAINS:
+for _terrain in (*TERRAINS, *EXTRA_TERRAINS):
     for _policy in ("Robust", "Energy"):
         gym.register(
             id=task_id(_terrain, _policy),

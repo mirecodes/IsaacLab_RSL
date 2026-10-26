@@ -4,18 +4,20 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Deployment of the trained A2 policies on a terrain map: difficulty rows 1-3, 20 robots on random tiles, steering
-(on the inclines: straight up or down the slope instead).
+(on the inclines: straight up or down the slope instead), one extra terrain type (``slip_field``).
 
 Built on the terrain-map play tasks (``forge/terrain``), whose map, physics and policy wiring stay as they are; see
 ``REPORT.md``.
 """
 
 import math
+from collections.abc import Callable
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.utils import configclass
 
 from isaaclab_tasks.forge.terrain.env_cfg import A2EnergyTerrainEnvCfg, A2RobustTerrainEnvCfg
+from isaaclab_tasks.forge.terrain.templates.rough_field import RoughFieldCfg
 from isaaclab_tasks.forge.terrain.world_cfg import TerrainWorldCfg
 
 from . import mdp
@@ -29,11 +31,31 @@ INCLINES = ("rough_slope", "rough_stairs", "slip_slope")
 """One-direction inclines rising along +x: robots face up or down them and are not turned."""
 INCLINE_YAW = math.radians(15.0)
 """Largest spawn yaw [rad] off the incline's +x / -x direction (the user's request: within about 15 deg)."""
+TRIGGERS = {
+    "crust_collapse": mdp.crust_collapse,
+    "sand_field": mdp.sand_sink,
+    "gravel_field": mdp.stone_step,
+    "slip_slope": mdp.foot_slip,
+    "slip_field": mdp.foot_slip,
+}
+"""Event trigger of each terrain type (``mdp/triggers.py``); the others sample normal walking (``random_walk``)."""
+
+
+def extra_templates() -> dict:
+    """Terrain types added to ``forge/terrain``'s catalog; keep the keys equal to ``EXTRA_TERRAINS`` in
+    ``__init__.py``."""
+    return {
+        # random foot slips on generic uneven ground: rough_field's template on the slip zone
+        "slip_field": RoughFieldCfg(zone="slip"),
+    }
 
 
 def deploy_world(terrain: str) -> TerrainWorldCfg:
-    """The terrain map of ``terrain`` cut to its first ``LEVELS`` rows, at the full map's difficulties."""
-    world = TerrainWorldCfg(terrain=terrain, num_levels=LEVELS, meta_path="")
+    """The terrain map of ``terrain`` (including :func:`extra_templates`) cut to its first ``LEVELS`` rows, at the
+    full map's difficulties."""
+    world = TerrainWorldCfg(num_levels=LEVELS, meta_path="")
+    world.terrains.update(extra_templates())
+    world.terrain = terrain
     template = world.terrains[terrain]
     lo, hi = template.difficulty_range or world.difficulty_range
     # row i of the full map: d_i = lo + (hi - lo) i / (FULL_LEVELS - 1); keep i < LEVELS
@@ -49,9 +71,11 @@ class DeployCurriculumCfg:
 
 
 def apply_deploy(env_cfg) -> None:
-    """20 robots, each episode on a random tile of the map; on an incline facing up or down it."""
+    """20 robots, each episode on a random tile of the map; on an incline facing up or down it; the terrain's event
+    trigger."""
     env_cfg.scene.num_envs = NUM_ROBOTS
     env_cfg.curriculum = DeployCurriculumCfg()
+    env_cfg.event_trigger = TRIGGERS.get(env_cfg.terrain_world.terrain, mdp.random_walk)
     if env_cfg.terrain_world.terrain in INCLINES:
         env_cfg.events.reset_base.func = mdp.reset_root_up_or_down
         env_cfg.events.reset_base.params["pose_range"]["yaw"] = (-INCLINE_YAW, INCLINE_YAW)
@@ -60,6 +84,9 @@ def apply_deploy(env_cfg) -> None:
 @configclass
 class A2RobustDeployEnvCfg(A2RobustTerrainEnvCfg):
     """Robust A2 teacher with forward-only steering commands (no turns on the inclines)."""
+
+    event_trigger: Callable | None = None
+    """``env -> bool [num_envs]``: the terrain event acts on the robot (``mdp/triggers.py``); set by the terrain."""
 
     def __post_init__(self):
         super().__post_init__()
@@ -87,6 +114,9 @@ class A2RobustDeployEnvCfg(A2RobustTerrainEnvCfg):
 class A2EnergyDeployEnvCfg(A2EnergyTerrainEnvCfg):
     """Energy A2 policy; it has no command input (fixed 0.9 m/s forward), so it cannot be steered."""
 
+    event_trigger: Callable | None = None
+    """As :attr:`A2RobustDeployEnvCfg.event_trigger`."""
+
     def __post_init__(self):
         super().__post_init__()
         apply_deploy(self)
@@ -96,5 +126,5 @@ POLICIES = {"Robust": A2RobustDeployEnvCfg, "Energy": A2EnergyDeployEnvCfg}
 
 
 def make_env_cfg(terrain: str, policy: str):
-    """The env cfg of ``IsaacContrib-Velocity-A2Deploy-<terrain>-<policy>``."""
+    """The env cfg of ``IsaacContrib-Surveillance-<terrain>-<policy>``."""
     return POLICIES[policy](terrain_world=deploy_world(terrain))

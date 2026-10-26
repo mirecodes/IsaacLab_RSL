@@ -5,9 +5,9 @@ Random mid-episode faults that a task adds to its env cfg. Shared infrastructure
 
 | Template | File | Fault |
 | --- | --- | --- |
-| Motor power out / power loss | [injector.py](injector.py) | one joint per episode, permanent from a random onset |
+| Motor power out / power loss / torque-constant loss | [injector.py](injector.py) | one joint per episode, permanent from a random onset |
 
-## Motor power out / power loss
+## Motor power out / power loss / torque-constant loss
 
 ```python
 from isaaclab_tasks.forge.fault_injector.injector import MotorFaultInjectorCfg, add_motor_faults
@@ -17,9 +17,16 @@ add_motor_faults(env_cfg, MotorFaultInjectorCfg(p_fault=0.7, power_loss_health=(
 
 `add_motor_faults` (robot with a `DCMotorCfg` actuator group, `base_legs` by default):
 
-1. swaps the group's class for `FaultyDCMotor`, which scales the DC-motor output by a health $h_{e,j} \in [0, 1]$:
+1. swaps the group's class for `FaultyDCMotor`, which scales the DC-motor output by a health $h_{e,j} \in [0, 1]$,
+   so the gain and the torque limit (the DC torque-speed curve) both shrink by $h$:
 
-   $$\tau_{e,j} = h_{e,j}\,\mathrm{clip}_{DC}\big(K_p (q^\ast - q) + K_d (\dot q^\ast - \dot q)\big) - [h_{e,j} = 0]\, d\, \dot q_{e,j}$$
+   $$\tau_{e,j} = h_{e,j}\,\mathrm{clip}_{DC}\big(K_p (q^\ast - q) + K_d (\dot q^\ast - \dot q)\big) - [h_{e,j} = 0]\, d\, \dot q_{e,j}
+   = \mathrm{clip}\big(h\,\tau_{PD},\ h\,\tau_{min}(\dot q),\ h\,\tau_{max}(\dot q)\big) - \dots$$
+
+   It also reports the drive's motor-current reading in torque units, $c = K_{t,nom}\, i = c_{e,j}\,
+   \mathrm{clip}_{DC}(\tau_{PD})$ (`FaultyDCMotor.motor_current`, observation term `motor_current`): the current
+   loop drives $i$ to the command, so $c_{e,j} = 1$ for a torque-constant loss and $c_{e,j} = h_{e,j}$ for a power
+   loss or power out (the supply limits the current).
 
 2. adds the `motor_fault` event (`MotorFaultInjector`, `interval` mode, every policy step). At every reset it draws
    the episode's fault:
@@ -27,16 +34,17 @@ add_motor_faults(env_cfg, MotorFaultInjectorCfg(p_fault=0.7, power_loss_health=(
    | Quantity | Distribution (default) |
    | --- | --- |
    | fault or nominal | fault with `p_fault` = 0.7 |
-   | type | `power_out` ($h = 0$) 0.5, `power_loss` 0.5 |
+   | type | `power_out` ($h = 0$) 0.5, `power_loss` 0.5 (`kt_loss` 0) |
    | joint | uniform over `joint_names` (all 12) |
    | onset | $U[2, 8]$ s after the reset, in policy steps |
    | power-loss health | $h \sim U[0.1, 0.6]$ |
+   | torque-constant-loss health | $h \sim U[0, 0.8]$ (`kt_loss_health`; demagnetized magnets, worn gear) |
    | ramp | `ramp_steps` = 0 (immediate); else linear from 1 to $h$ |
    | passive damping $d$ | 0 N·m·s/rad |
 
 3. adds the observation group `fault` (labels, never a policy input), per env, $J$ = 12:
    `[fault_mask (J), fault_type, health (J), onset_step, steps_since_onset, severity]`.
-   `fault_type` 0 none / 1 power out / 2 power loss; `steps_since_onset` = -1 before the onset.
+   `fault_type` 0 none / 1 power out / 2 power loss / 3 torque-constant loss; `steps_since_onset` = -1 before the onset.
 
 **Timing.** The event runs after the step's resets and before its observations. It first stores the health the
 finished physics step used (the labels of the observation computed next), then sets the health of the next step. So
@@ -54,6 +62,9 @@ drawn from a `torch.Generator` seeded with `seed` (default: the env seed), so a 
   (`forge/fault_detector/motor_failure_detector/REPORT.md`).
 - **The injector owns schedule, health and labels**; the actuator only reads `health`. One `interval` event at
   policy rate is enough: the fault starts at a policy step, as the labels are per policy step.
+- **Torque-constant loss (`kt_loss`, 2026-10-26)**: the same torque law as a power loss (gain and limit scaled by
+  $h$); only the current reading differs, which a detector with a motor-current input sees. Its $h$ comes from the
+  same uniform draw as the power-loss one, so seeds without `kt_loss` give the schedules of earlier datasets.
 - **Not implemented** (spec "cfg hook only"): recovery (`recover_prob`) and several faulty joints
   (`max_faulty_joints`). Add them in `MotorFaultInjector.reset` / `__call__` when a study needs them; the labels
   (`fault_mask` per joint) already allow several joints.

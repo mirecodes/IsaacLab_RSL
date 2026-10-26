@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import os
 import random
 import sys
@@ -53,8 +54,18 @@ POLICY = ("../../results/euler/isaaclab3/rsl_rl/a2_study_robust_teacher/2026-10-
 GREEN, RED, GRAY = 0xFF40C040, 0xFF3030FF, 0xFF808080
 
 
+def run_inputs(run_dir: str) -> list[str]:
+    """Raw input terms of a detector run, in order: ``xp.RAW`` for a ``tmp/explore.py`` run, the trained inputs of
+    an ``experiment.py matrix`` run."""
+    if os.path.exists(os.path.join(run_dir, "val.json")):
+        return xp.RAW
+    state = torch.load(os.path.join(run_dir, "checkpoint.pt"), map_location="cpu", weights_only=False)
+    return list(dict.fromkeys(name.split("[")[0] for name in state["input_names"]))
+
+
 class LiveDetector:
-    """A ``tmp/explore.py`` run (``mlp`` / ``joint`` model, PD rate) fed one raw sample at a time.
+    """A ``tmp/explore.py`` run (``mlp`` / ``joint`` model) or an ``experiment.py matrix`` run (MLP / GRU), at the
+    PD rate, fed one raw sample at a time.
 
     Reproduces the offline pipeline for one episode: the window of the last ``history_length`` policy steps of
     samples (padded with the first), noise drawn per window as in the evaluation, the logit score and the run's
@@ -63,6 +74,9 @@ class LiveDetector:
 
     def __init__(self, run_dir: str, names: list[str], joint_names: list[str], sample_dt: float, device, noise=True):
         state = torch.load(os.path.join(run_dir, "checkpoint.pt"), map_location="cpu", weights_only=False)
+        if not os.path.exists(os.path.join(run_dir, "val.json")):
+            self._init_matrix_run(run_dir, state, names, joint_names, sample_dt, device, noise)
+            return
         with open(os.path.join(run_dir, "val.json")) as f:
             val = json.load(f)
         fields = {f.name for f in dataclasses.fields(fd.DetectorCfg)}
@@ -85,12 +99,36 @@ class LiveDetector:
         if self.src.dim != state["input_dim"]:
             raise ValueError(f"{run_dir}: {self.src.dim} live inputs, the checkpoint has {state['input_dim']}")
         self.model = xp.build(self.spec, self.cfg, self.src, ex.joint_legs(joint_names)).to(device).eval()
-        self.model.load_state_dict(state["model"])
+        fd.load_state(self.model, state["model"])
         self.noise, self.skip = noise, round(self.cfg.skip_initial_s / sample_dt)
         self.cap = 2 * self.rule["thr"]
         """CUSUM ceiling: the threshold crossing is unchanged, and the statistic falls back within a few samples once
         a fault ends (offline, a fault never ends; uncapped, the sum would stay over the threshold for seconds)."""
         self.last = torch.tensor([self.length], device=device)
+        self.reset()
+
+    def _init_matrix_run(self, run_dir, state, names, joint_names, sample_dt, device, noise) -> None:
+        """An ``experiment.py matrix`` run (MLP / GRU on raw windows): its validation threshold at
+        ``MAIN_TARGET`` false alarms / min, ``max_j p_j > tau`` held for ``k`` samples, as a debounce rule on logits."""
+        with open(os.path.join(run_dir, "metrics.json")) as f:
+            calib = next(c for c in json.load(f)["calibration"] if c["target"] == ex.MAIN_TARGET)
+        self.model, self.cfg = fd.load_detector(state, device)
+        if self.cfg.rate != "pd" or names != state["input_names"]:
+            raise ValueError(f"{run_dir}: needs a PD-rate run with inputs {names[:3]}..., got {self.cfg.rate}")
+        tau = min(calib["tau"], 1 - 1e-7)
+        self.rule = {"rule": f"p > {tau:.3f} for {calib['k']}", "drift": None, "thr": math.log(tau / (1 - tau)),
+                     "k": calib["k"]}  # fmt: skip
+        self.length = n = state["window"]
+        noise_cols = np.array([fd.INPUTS[c.split("[")[0]][3] for c in names], np.float32) * self.cfg.noise_scale_mult
+        window = fd.Episodes(x=np.zeros((n, len(names)), np.float32), mask=np.zeros((n, len(joint_names)), bool),
+                             ftype=np.zeros(n, np.int8), since=np.full(n, -1, np.int32), t=np.zeros(n, np.int32),
+                             start=np.zeros(n, np.int64), contact=None, command=None, ep_start=np.zeros(1, np.int64),
+                             ep_len=np.array([n]), onset=np.array([n]), episodes=[], noise=noise_cols, names=names,
+                             sample_dt=sample_dt, per_step=n // self.cfg.history_length)  # fmt: skip
+        self.src = fd.WindowSource(window, self.cfg, device, state["mean"], state["std"])
+        self.src.num_joints = len(joint_names)
+        self.noise, self.skip, self.cap = noise, round(self.cfg.skip_initial_s / sample_dt), float("inf")
+        self.last = torch.tensor([n - 1], device=device)
         self.reset()
 
     def reset(self) -> None:
@@ -207,7 +245,8 @@ class Overlay:
 
 class FaultSchedule:
     """Healthy and faulty periods of random length, one faulty joint at most: replaces the injector's one fault per
-    episode. Each fault picks a joint, a type (``fault_types``) and a health (``power_loss_health``) at random."""
+    episode. Each fault picks a joint, a type (``fault_types``) and a health (``power_loss_health``, or
+    ``kt_loss_health`` for ``kt_loss``) at random."""
 
     def __init__(self, fault_cfg, num_joints: int, off_s, on_s, step_dt: float, seed: int):
         self.cfg, self.num_joints, self.off_s, self.on_s, self.dt = fault_cfg, num_joints, off_s, on_s, step_dt
@@ -224,14 +263,20 @@ class FaultSchedule:
         if self.t >= self.until:
             if self.fault is None:
                 kind = self.rng.choices(list(self.cfg.fault_types), weights=list(self.cfg.fault_types.values()))[0]
-                h = 0.0 if kind == "power_out" else self.rng.uniform(*self.cfg.power_loss_health)
-                self.fault, self.until = (self.rng.randrange(self.num_joints), h), self.t + self.rng.uniform(*self.on_s)
+                h_range = self.cfg.kt_loss_health if kind == "kt_loss" else self.cfg.power_loss_health
+                h = 0.0 if kind == "power_out" else self.rng.uniform(*h_range)
+                self.fault = (self.rng.randrange(self.num_joints), h, kind)
+                self.until = self.t + self.rng.uniform(*self.on_s)
             else:
                 self.fault, self.until = None, self.t + self.rng.uniform(*self.off_s)
         health = [1.0] * self.num_joints
         if self.fault is not None:
             health[self.fault[0]] = self.fault[1]
         return health
+
+    def current_health(self, health: list[float]) -> list[float]:
+        """The motor-current reading factor of every column (``FaultyDCMotor``): 1 for a torque-constant loss."""
+        return [1.0] * self.num_joints if self.fault is not None and self.fault[2] == "kt_loss" else health
 
 
 class FaultView:
@@ -255,6 +300,10 @@ class FaultView:
         """Active fault: joint, health, onset sample."""
         self.detected: str | None = None
         """The active (or last) fault's detection."""
+        self.first: str | None = None
+        """Latency of the active fault's first detection: shown again if the flag drops and rises."""
+        self.ended: tuple[int, int] | None = None
+        """Last ended fault: joint, end sample."""
         self.marks: dict[int, str] = {}
         """Flagged joint -> its detection text, kept while the flag holds."""
 
@@ -269,7 +318,7 @@ class FaultView:
         faulty = (health < 1).nonzero().flatten().tolist()
         if faulty and (self.fault is None or self.fault[0] != faulty[0]):
             self.end_fault()
-            self.fault, self.detected = (faulty[0], float(health[faulty[0]]), self.n), None
+            self.fault, self.detected, self.first = (faulty[0], float(health[faulty[0]]), self.n), None, None
         elif not faulty and self.fault is not None:
             self.end_fault()
         self.health = health
@@ -278,13 +327,18 @@ class FaultView:
             if not f:
                 self.marks.pop(j, None)
             elif j not in self.marks:
-                if self.fault is None:
+                if self.fault is None and self.ended is not None and self.ended[0] == j and \
+                        self.n - self.ended[1] < self.det.length:
+                    # the window still holds faulty samples of the fault that just ended
+                    self.marks[j] = "fault just ended"
+                elif self.fault is None:
                     self.marks[j] = "false alarm"
                 elif self.fault[0] != j:
                     self.marks[j] = f"wrong joint ({self.names[self.fault[0]]} is faulty)"
                 else:
-                    self.marks[j] = self.ms(self.n - self.fault[2])
-                    self.detected = self.detected or f"{self.names[j]} after {self.marks[j]}"
+                    self.first = self.first or self.ms(self.n - self.fault[2])
+                    self.marks[j] = self.first
+                    self.detected = self.detected or f"{self.names[j]} after {self.first}"
         self.n += 1
 
     def end_fault(self) -> None:
@@ -293,7 +347,7 @@ class FaultView:
         j, h, onset = self.fault
         self.log(f"[fault] {self.names[j]} factor={h:.2f} from t={onset * self.dt:.2f} s for "
                  f"{(self.n - onset) * self.dt:.2f} s: {self.detected or 'MISSED'}")  # fmt: skip
-        self.fault = None
+        self.fault, self.ended = None, (j, self.n)
 
     def refresh(self) -> None:
         if self.health is None:
@@ -361,6 +415,31 @@ def selftest() -> None:
                 assert first == (int(hits[0]) if len(hits) else None), (rule["rule"], e, first, hits[:3])
                 alarmed += first is not None
             assert alarmed > 0, rule["rule"]
+
+        # an experiment.py matrix run (MLP on raw windows): live logits and first alarms equal the offline ones
+        exp = os.path.join(root, "exp")
+        ex.cmd_matrix(argparse.Namespace(exp_dir=exp, overrides=overrides + ["rate=pd"], archs=["mlp"],
+                                         obs_sets=["proprio"], seeds=[0], reevaluate=False))  # fmt: skip
+        run_dir = os.path.join(exp, "mlp_proprio_s0")
+        val_ids = fd.split_episodes(fd.read_index(root), cfg0.split)["val"]
+        val = fd.load_episodes(root, run_inputs(run_dir), val_ids, "pd")
+        live = LiveDetector(run_dir, val.names, joint_names, val.sample_dt, "cpu", noise=False)
+        state = torch.load(os.path.join(run_dir, "checkpoint.pt"), map_location="cpu", weights_only=False)
+        model, cfg = fd.load_detector(state, "cpu")
+        prob = fd.predict(model, fd.WindowSource(val, cfg, "cpu", state["mean"], state["std"]), False)[0]
+        tau = 1 / (1 + math.exp(-live.rule["thr"]))
+        on = fd.held(prob.max(axis=1) > tau, live.rule["k"]) & (val.t >= live.skip)
+        for e in range(min(len(val.ep_len), 20)):
+            s, n = int(val.ep_start[e]), int(val.ep_len[e])
+            live.reset()
+            first = None
+            for i in range(n):
+                if live.update(torch.from_numpy(val.x[s + i].astype(np.float32))).any() and first is None:
+                    first = i
+                p = np.clip(prob[s + i], 1e-7, 1 - 1e-7)
+                assert np.allclose(live.stat.numpy(), np.log(p) - np.log1p(-p), atol=1e-3), ("matrix", e, i)
+            hits = np.flatnonzero(on[s : s + n])
+            assert first == (int(hits[0]) if len(hits) else None), ("matrix", e, first, hits[:3])
     check_faults()
     print("demo selftest passed")
 
@@ -381,6 +460,7 @@ def check_faults() -> None:
 
     class Stub:  # flags[n]: joints flagged at sample n
         flags_at: dict[int, list[int]] = {}
+        length = 4  # window [samples]
 
         def reset(self):
             self.n = 0
@@ -394,8 +474,8 @@ def check_faults() -> None:
     lines: list[str] = []
     view = FaultView(Stub(), [f"j{i}" for i in range(12)], 0.005, 0.02, log=lines.append)
     # joint 2 fails at sample 10 (its substep is faulty, seen from sample 11 on) and recovers at 30; joint 7 fails at
-    # 40 for 10 samples, never detected
-    Stub.flags_at = {14: [2], 15: [2, 5], 33: [9]}
+    # 40 for 10 samples, never detected; joint 2's flag rises again at 20 (same fault) and at 31 (just ended)
+    Stub.flags_at = {14: [2], 15: [2, 5], 20: [2], 31: [2], 33: [9]}
     for n in range(60):
         health = torch.ones(12)
         if 10 <= n < 30:
@@ -405,6 +485,10 @@ def check_faults() -> None:
         view.update(None, health)
         if n == 15:
             assert view.marks == {2: "20 ms (1.00 steps)", 5: "wrong joint (j2 is faulty)"}, view.marks
+        if n == 20:
+            assert view.marks == {2: "20 ms (1.00 steps)"}, view.marks
+        if n == 31:
+            assert view.marks == {2: "fault just ended"}, view.marks
         if n == 33:
             assert view.marks == {9: "false alarm"}, view.marks
     view.end_episode()
@@ -418,6 +502,7 @@ def main() -> None:
     parser.add_argument("--detector", default=None, help=f"Run directory of tmp/explore.py (default: {DETECTORS}).")
     parser.add_argument("--fault_types", nargs="+", default=["power_loss=1"], help="e.g. power_out=0.5 power_loss=0.5")
     parser.add_argument("--power_loss_health", type=float, nargs=2, default=None, help="h range (task: 0.1 0.6).")
+    parser.add_argument("--kt_loss_health", type=float, nargs=2, default=None, help="kt_loss h range (task: 0 0.8).")
     parser.add_argument("--off_s", type=float, nargs=2, default=(2.0, 5.0), help="Healthy period range [s].")
     parser.add_argument("--on_s", type=float, nargs=2, default=(2.0, 5.0), help="Fault period range [s].")
     parser.add_argument("--fault_seed", type=int, default=None, help="Seed of the fault schedule (default: random).")
@@ -490,6 +575,8 @@ def main() -> None:
         fault_cfg.fault_types = {k: float(v) for k, v in (s.split("=") for s in demo_args.fault_types)}
         if demo_args.power_loss_health is not None:
             fault_cfg.power_loss_health = tuple(demo_args.power_loss_health)
+        if demo_args.kt_loss_health is not None:
+            fault_cfg.kt_loss_health = tuple(demo_args.kt_loss_health)
         if demo_args.episode_s is not None:
             env_cfg.episode_length_s = demo_args.episode_s
         elif demo_args.record:
@@ -518,16 +605,17 @@ def main() -> None:
             sample_dt = base.step_dt / base.cfg.decimation
 
             def raw_sample() -> tuple[torch.Tensor, torch.Tensor]:
-                """Env 0's raw detector inputs (``xp.RAW`` order) and the health of the substep about to run."""
+                """Env 0's raw detector inputs (``inputs`` order) and the health of the substep about to run."""
                 s = pd_sample(base)
                 s["tracking_error"] = s["joint_pos_target"] - s["joint_pos_rel"]
                 health = torch.ones(robot.num_joints, device=base.device)
                 health[injector.columns] = injector.actuator.health[0]
-                return torch.cat([s[name][0] for name in xp.RAW]).float(), health
+                return torch.cat([s[name][0] for name in inputs]).float(), health
 
             shapes = {k: v.shape[1] for k, v in pd_sample(base).items()}
             shapes["tracking_error"] = robot.num_joints
-            names = [f"{name}[{i}]" for name in xp.RAW for i in range(shapes[name])]
+            inputs = run_inputs(run_dir)
+            names = [f"{name}[{i}]" for name in inputs for i in range(shapes[name])]
             detector = LiveDetector(run_dir, names, robot.joint_names, sample_dt, base.device, not demo_args.no_noise)
             panel = Overlay(robot.joint_names, detector.rule) if demo_args.record else None
             if not demo_args.console:
@@ -574,7 +662,9 @@ def main() -> None:
                     view.end_episode()
                     schedule.reset()
                 # after the injector's event (which wrote h = 1): the health of the next step's substeps
-                actuator.health[0] = torch.tensor(schedule.step(), device=base.device)
+                health = schedule.step()
+                actuator.health[0] = torch.tensor(health, device=base.device)
+                actuator.current_health[0] = torch.tensor(schedule.current_health(health), device=base.device)
 
             if demo_args.record:
                 record(base, step, view, panel, demo_args, log)

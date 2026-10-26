@@ -13,11 +13,16 @@ Every robot keeps a ring buffer of the last ``--buffer_s`` seconds of its state.
 * with ``--contact_onsets``, also the onset of contact on a non-foot body (base, hip, thigh, calf), after a
   ``--grace_s`` spawn grace and at most once per robot per buffer length; the robot keeps walking.
 
+With ``--max_triggers`` and a task that sets ``event_trigger`` (``forge/surveillance``), windows of the same length
+centered on the trigger's rising edges (the terrain event acting on the robot, or random normal walking) are saved
+apart from the failures, into ``triggers/events/`` and ``triggers/index.csv``, spread evenly over ``--max_steps``.
+They do not stop the collection.
+
 Every finished episode (failure, time-out, or leaving its tile on a terrain map) is listed in ``episodes.csv``, and
 ``summary.json`` holds the success rate and play time per difficulty row. See ``README.md`` next to this file for
 the data layout. Runs headless until ``--max_events`` events or ``--max_steps`` env steps, e.g. on Euler::
 
-    euler enqueue fault_a2_robust -- python scripts/forge/fault_analysis/collect.py \\
+    euler enqueue fault_a2_robust -- python scripts/forge/surveillance/collect.py \\
         --task IsaacContrib-Velocity-A2Study-RobustTeacher \\
         --checkpoint /workspace/isaaclab/logs/rsl_rl/a2_study_robust_teacher/<run>/model_2999.pt
 """
@@ -32,6 +37,7 @@ import contextlib  # noqa: E402
 import csv  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
+import math  # noqa: E402
 import os  # noqa: E402
 import sys  # noqa: E402
 import time  # noqa: E402
@@ -88,17 +94,31 @@ class FaultRecorder(RecorderTerm):
         self._length = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
         self._since_event = torch.full_like(self._length, self.num_frames)
         self._in_contact = torch.zeros(env.num_envs, len(self.trigger_ids), dtype=torch.bool, device=env.device)
-        os.makedirs(os.path.join(cfg.output_dir, "events"), exist_ok=True)
-        self._index_path = os.path.join(cfg.output_dir, "index.csv")
-        with open(self._index_path, "w", newline="") as f:
-            csv.writer(f).writerow(
-                ["event", "env_id", "step", "sim_time_s", "episode_step", "num_frames", "terrain_level",
-                 "terrain_type", "terminal", "terminations", "base_contact", "contact_bodies"]
-            )  # fmt: skip
+        self._new_index(cfg.output_dir)
+        # event triggers: the task's env -> bool [num_envs], a window centered on each rising edge
+        self.trigger = getattr(env.cfg, "event_trigger", None) if cfg.max_triggers > 0 else None
+        self.num_triggers = 0
+        self.post_frames = self.num_frames // 2
+        self._trigger_dir = os.path.join(cfg.output_dir, "triggers")
+        self._signal = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self._wait = torch.full_like(self._length, -1)
+        """Frames until a started trigger window is saved; -1: none."""
+        self._since_trigger = torch.full_like(self._length, self.num_frames)
+        if self.trigger is not None:
+            self._new_index(self._trigger_dir)
         self.episodes: list[dict] = []
         self._episodes_path = os.path.join(cfg.output_dir, "episodes.csv")
         with open(self._episodes_path, "w", newline="") as f:
             csv.writer(f).writerow(EPISODE_FIELDS)
+
+    @staticmethod
+    def _new_index(root: str) -> None:
+        os.makedirs(os.path.join(root, "events"), exist_ok=True)
+        with open(os.path.join(root, "index.csv"), "w", newline="") as f:
+            csv.writer(f).writerow(
+                ["event", "env_id", "step", "sim_time_s", "episode_step", "num_frames", "terrain_level",
+                 "terrain_type", "terminal", "terminations", "base_contact", "contact_bodies"]
+            )  # fmt: skip
 
     def sample(self) -> dict[str, torch.Tensor]:
         """Everything logged per step, each of shape (num_envs, ...)."""
@@ -178,13 +198,46 @@ class FaultRecorder(RecorderTerm):
         if len(ids) > 0:
             self._save(ids, in_contact[ids])
             self._since_event[ids] = 0
+        if self.trigger is not None:
+            self._update_triggers(in_contact)
         return None, None
+
+    def _update_triggers(self, in_contact: torch.Tensor) -> None:
+        """Save the trigger windows that are complete; start one on a rising edge of the trigger, for robots with
+        enough history for a full window, at least a window after their last trigger, within the budget: at most
+        ``max_triggers``, and with ``pace_steps`` at most ``max_triggers * step / pace_steps`` so far (spread over
+        the play)."""
+        env, cfg = self._env, self.cfg
+        self._since_trigger += 1
+        self._wait[self._wait > 0] -= 1
+        due = (self._wait == 0).nonzero().squeeze(-1)
+        if len(due) > 0:
+            self._save(due, in_contact[due], triggers=True)
+            self._wait[due] = -1
+        signal = self.trigger(env)
+        rising = signal & ~self._signal
+        self._signal = signal
+        budget = cfg.max_triggers
+        if cfg.pace_steps:
+            budget = min(budget, math.ceil(cfg.max_triggers * env.common_step_counter / cfg.pace_steps))
+        budget -= self.num_triggers + int((self._wait >= 0).sum())
+        start = rising & (self._wait < 0) & (self._since_trigger >= self.num_frames)
+        start &= self._length >= self.num_frames - self.post_frames
+        ids = start.nonzero().squeeze(-1)
+        if budget <= 0 or len(ids) == 0:
+            return
+        ids = ids[torch.randperm(len(ids), device=ids.device)[:budget]]
+        self._wait[ids] = self.post_frames
+        self._since_trigger[ids] = 0
 
     def record_pre_reset(self, env_ids):
         ids = torch.as_tensor(env_ids, dtype=torch.long, device=self._env.device)
         self._log_episodes(ids[self._length[ids] > 0])
         self._length[ids] = 0
         self._since_event[ids] = self.num_frames
+        # a trigger window cut by the reset is dropped (a fall inside it is a failure event)
+        self._wait[ids] = -1
+        self._signal[ids] = False
         return None, None
 
     def _log_episodes(self, ids: torch.Tensor, running: bool = False) -> None:
@@ -222,8 +275,11 @@ class FaultRecorder(RecorderTerm):
         """Log the running episodes as ``running``."""
         self._log_episodes((self._length > 0).nonzero().squeeze(-1), running=True)
 
-    def _save(self, ids: torch.Tensor, in_contact: torch.Tensor) -> None:
+    def _save(self, ids: torch.Tensor, in_contact: torch.Tensor, triggers: bool = False) -> None:
+        """Save the windows of ``ids``: failures into ``events/``, trigger windows into ``triggers/events/``."""
         env = self._env
+        root = self._trigger_dir if triggers else self.cfg.output_dir
+        first = self.num_triggers if triggers else self.num_events
         manager = env.termination_manager
         # oldest -> newest; _ptr is the next slot to write, i.e. the oldest frame
         order = (torch.arange(self.num_frames, device=env.device) + self._ptr) % self.num_frames
@@ -246,7 +302,7 @@ class FaultRecorder(RecorderTerm):
             level = int(levels[env_id]) if levels is not None else -1
             col = int(types[env_id]) if types is not None else -1
             np.savez_compressed(
-                os.path.join(self.cfg.output_dir, "events", f"{self.num_events:06d}.npz"),
+                os.path.join(root, "events", f"{first + i:06d}.npz"),
                 **{k: v[i, -n:] for k, v in data.items()},
                 env_id=env_id,
                 step=env.common_step_counter,
@@ -257,13 +313,17 @@ class FaultRecorder(RecorderTerm):
                 contact_bodies=np.array(bodies),
             )
             rows.append(
-                [self.num_events, env_id, env.common_step_counter, f"{env.common_step_counter * env.step_dt:.2f}",
+                [first + i, env_id, env.common_step_counter, f"{env.common_step_counter * env.step_dt:.2f}",
                  int(env.episode_length_buf[env_id]), n, level, col, bool(terminations), "|".join(terminations),
                  self.robot.body_names[0] in bodies, "|".join(bodies)]
             )  # fmt: skip
-            self.num_events += 1
-            self.num_terminal += bool(terminations)
-        with open(self._index_path, "a", newline="") as f:
+            if not triggers:
+                self.num_terminal += bool(terminations)
+        if triggers:
+            self.num_triggers += len(rows)
+        else:
+            self.num_events += len(rows)
+        with open(os.path.join(root, "index.csv"), "a", newline="") as f:
             csv.writer(f).writerows(rows)
 
 
@@ -276,6 +336,8 @@ class FaultRecorderCfg(RecorderTermCfg):
     threshold: float = 1.0
     grace_s: float = 1.0
     contact_onsets: bool = False
+    max_triggers: int = 0
+    pace_steps: int | None = None
 
 
 @configclass
@@ -318,6 +380,8 @@ def configure_env(env_cfg, fault_args: argparse.Namespace, output_dir: str) -> N
             threshold=fault_args.contact_threshold,
             grace_s=fault_args.grace_s,
             contact_onsets=fault_args.contact_onsets,
+            max_triggers=fault_args.max_triggers,
+            pace_steps=fault_args.max_steps,
         )
     )
 
@@ -408,9 +472,12 @@ def main() -> None:
         "--terminations", nargs="+", default=["base_contact"], help="Failure terms kept (the others are removed)."
     )
     parser.add_argument("--contact_onsets", action="store_true", help="Also record non-foot contact onsets.")
+    parser.add_argument(
+        "--max_triggers", type=int, default=0, help="Also record up to this many event-trigger windows (triggers/)."
+    )
     parser.add_argument("--disturbances", action="store_true", help="Keep the task's pushes and external wrench.")
     parser.add_argument("--sub_terrains", nargs="+", default=None, help="Keep only these sub-terrains.")
-    parser.add_argument("--output_dir", default=None, help="Default: logs/fault_analysis/<experiment>/<time>_<run>.")
+    parser.add_argument("--output_dir", default=None, help="Default: logs/surveillance/<experiment>/<time>_<run>.")
     fault_args, argv = parser.parse_known_args(sys.argv[1:])
     args_cli = _parse_args(argv)
 
@@ -429,7 +496,7 @@ def main() -> None:
         output_dir = os.path.abspath(
             fault_args.output_dir
             or os.path.join(
-                "logs", "fault_analysis", agent_cfg.experiment_name,
+                "logs", "surveillance", agent_cfg.experiment_name,
                 f"{datetime.now():%Y-%m-%d_%H-%M-%S}_{run_name}_{checkpoint}",
             )
         )  # fmt: skip
@@ -471,7 +538,7 @@ def main() -> None:
                         print(
                             f"[fault] step {step} ({sim_s:.0f} s sim, {robot_h:.1f} robot-h, "
                             f"{time.time() - start:.0f} s wall): {recorder.num_events} events "
-                            f"({recorder.num_terminal} terminal)",
+                            f"({recorder.num_terminal} terminal), {recorder.num_triggers} triggers",
                             flush=True,
                         )
             recorder.finish()
@@ -487,6 +554,8 @@ def main() -> None:
                 wall_s=round(time.time() - start, 1),
                 num_envs=env.num_envs,
                 events=recorder.num_events,
+                triggers=recorder.num_triggers,
+                event_trigger=getattr(recorder.trigger, "__name__", None),
                 stopped_by="max_events" if recorder.num_events >= fault_args.max_events else "max_steps",
             )
             with open(os.path.join(output_dir, "summary.json"), "w") as f:

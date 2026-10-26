@@ -29,7 +29,7 @@ def test_summarize():
 
 
 def test_terrains():
-    assert "rough_field" in terrains() and len(terrains()) == len(set(terrains()))
+    assert {"rough_field", "slip_field"} <= set(terrains()) and len(terrains()) == len(set(terrains())) == 10
 
 
 if __name__ == "__main__":

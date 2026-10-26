@@ -166,10 +166,12 @@ def cmd_matrix(args) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     meta = fd.read_meta(base.dataset_dir)
     legs = joint_legs(meta["joint_names"])
-    split = fd.split_episodes(fd.read_index(base.dataset_dir), base.split)
+    split = fd.split_episodes(fd.within_health(fd.read_index(base.dataset_dir), base.max_health), base.split)
     os.makedirs(args.exp_dir, exist_ok=True)
     fd.save_json(os.path.join(args.exp_dir, "split.json"), {k: v.tolist() for k, v in split.items()})
+    obs_sets = args.obs_sets or OBS_SETS
     inputs = fd.PROPRIO + fd.PRIV + list(base.extra_terms)
+    inputs += ["motor_current"] if "proprio_current" in obs_sets else []
     load = lambda d, ids=None: fd.load_episodes(d, inputs, ids, base.rate)  # noqa: E731
     print(f"[matrix] loading {base.dataset_dir} at the {base.rate} rate "
           f"({', '.join(f'{k} {len(v)}' for k, v in split.items())} episodes)", flush=True)  # fmt: skip
@@ -178,10 +180,11 @@ def cmd_matrix(args) -> None:
     test_all = {"test": load(base.dataset_dir, split["test"])}
     for d in base.test_dirs:
         if os.path.exists(os.path.join(d, "index.csv")):
-            test_all[set_name(d)] = load(d)
+            kept = fd.within_health(fd.read_index(d), base.max_health)
+            test_all[set_name(d)] = load(d, [r["episode_id"] for r in kept])
     print(f"[matrix] {len(train_all) if train_all is not None else 0} train / {len(val_all)} val samples; test sets: "
           + ", ".join(f"{k} ({len(v.episodes)} episodes)" for k, v in test_all.items()), flush=True)  # fmt: skip
-    for obs_set in args.obs_sets or OBS_SETS:
+    for obs_set in obs_sets:
         for arch in args.archs or ARCHS:
             for seed in args.seeds or SEEDS:
                 cfg = dataclasses.replace(base, arch=arch, obs_set=obs_set, seed=seed)
@@ -201,6 +204,35 @@ def cmd_matrix(args) -> None:
 # sanity: injector and dataset checks
 
 
+def motor_current_check(shard, by_id: dict, J: int, m: int) -> dict:
+    """PD-rate check of the injector's current reading: the applied torque is ``h`` x the reading on a ``kt_loss``
+    joint and equal to it everywhere else (both of the previous substep, so sample ``n`` uses the health label of
+    observation ``(n - 1) // m + 1``, the step whose physics ran that substep)."""
+    applied = shard["pd/applied_torque"].astype(np.float32)
+    current = shard["pd/motor_current"].astype(np.float32)
+    labels = shard["fault/labels"]
+    err, faulty_ratio = [], []
+    start = 0
+    for e, n in enumerate(shard["ep_len"]):
+        kt = int(by_id[int(shard["episode_id"][e])]["fault_type"]) == fd.FAULT_TYPES.index("kt_loss")
+        health = labels[start : start + n, J + 1 : 2 * J + 1]
+        s = np.arange(1, n * m)
+        s = s[(s - 1) // m + 1 < n]
+        h = health[(s - 1) // m + 1] if kt else np.ones((len(s), J))
+        a, c = applied[start * m + s], current[start * m + s]
+        err.append(np.abs(a - h * c) / (1.0 + np.abs(c)))
+        big = (h < 1) & (np.abs(c) > 5.0)
+        faulty_ratio += list(zip(h[big], a[big] / c[big]))
+        start += n
+    err = np.concatenate(err)
+    out = {"samples": int(err.size), "max_rel_err_applied_vs_h_current": float(err.max()),
+           "note": "|tau - h c| / (1 + |c|), float16 storage"}  # fmt: skip
+    if faulty_ratio:
+        r = np.array(faulty_ratio)
+        out["kt_loss_tau_over_current_vs_h_max_abs_diff"] = float(np.abs(r[:, 1] - r[:, 0]).max())
+    return out
+
+
 def cmd_sanity(args) -> None:
     """Label, schedule, torque and PD-rate alignment checks of one dataset, plus onset plots (``sanity/``)."""
     meta = fd.read_meta(args.dataset_dir)
@@ -212,13 +244,15 @@ def cmd_sanity(args) -> None:
     report = {"episodes": len(index), "steps": int(sum(int(r["length"]) for r in index))}
     faulty = [r for r in index if int(r["has_fault"])]
     report["fault_fraction"] = len(faulty) / len(index)
-    report["fault_type_counts"] = {fd.FAULT_TYPES[t]: sum(int(r["fault_type"]) == t for r in faulty) for t in (1, 2)}
+    types = range(1, len(fd.FAULT_TYPES))
+    report["fault_type_counts"] = {fd.FAULT_TYPES[t]: sum(int(r["fault_type"]) == t for r in faulty) for t in types}
     report["fault_joint_counts"] = {names[j]: sum(int(r["fault_joint"]) == j for r in faulty) for j in range(J)}
     onset_s = np.array([int(r["onset_step"]) * meta["step_dt"] for r in faulty])
-    h = np.array([float(r["health"]) for r in faulty if int(r["fault_type"]) == 2])
     report["onset_s"] = {"min": onset_s.min(), "max": onset_s.max(), "mean": onset_s.mean(), "cfg": cfg["onset_time_s"]}
-    if len(h):
-        report["power_loss_h"] = {"min": h.min(), "max": h.max(), "mean": h.mean(), "cfg": cfg["power_loss_health"]}
+    for t, key in ((2, "power_loss_health"), (3, "kt_loss_health")):
+        h = np.array([float(r["health"]) for r in faulty if int(r["fault_type"]) == t])
+        if len(h):
+            report[f"{fd.FAULT_TYPES[t]}_h"] = {"min": h.min(), "max": h.max(), "mean": h.mean(), "cfg": cfg.get(key)}
     reasons: dict[str, dict[str, int]] = {}
     for r in index:
         kind = fd.FAULT_TYPES[int(r["fault_type"])]
@@ -281,6 +315,8 @@ def cmd_sanity(args) -> None:
             "max_abs_joint_vel_diff_at_m_t": float(np.abs(pd_vel[::m] - vel).max()),
             "median_abs_joint_pos_step_within_policy_step": float(np.median(np.abs(np.diff(pd_pos, axis=0)))),
         }
+    if "pd/motor_current" in shard.files:
+        report["motor_current"] = motor_current_check(shard, by_id, J, int(meta["decimation"]))
     fd.save_json(os.path.join(out, "sanity.json"), report)
     print(json.dumps(fd.json_safe(report), indent=2))
 
@@ -347,6 +383,12 @@ def load_runs(exp: str) -> dict[tuple[str, str], dict[int, dict]]:
     return runs
 
 
+def run_configs(runs: dict) -> list[tuple[str, str]]:
+    """The (arch, obs_set) pairs of ``runs``: ``OBS_SETS`` first, then any other obs set."""
+    obs_sets = list(OBS_SETS) + sorted({o for _, o in runs} - set(OBS_SETS))
+    return [(a, o) for o in obs_sets for a in ARCHS if (a, o) in runs]
+
+
 def op(m: dict, set_: str = "test_id", noise: str = "noise_on", target: float = MAIN_TARGET) -> dict:
     """Closed-loop summary of one run at a false-alarm target."""
     return next(x for x in m[set_][noise]["closed_loop"] if x["target"] == target)
@@ -398,15 +440,17 @@ def axis_value(row: dict, axis: str, names: list[str]) -> str | None:
         return joint_kind(names[joint])
     if axis == "front_hind":
         return "front" if names[joint][0] == "F" else "hind"
-    if axis == "power_loss_h":
+    if axis == "health_h":
         lo = np.floor(float(row["health"]) * 10) / 10
-        return f"h in [{lo:.1f}, {lo + 0.1:.1f})" if row["fault_type"] == "power_loss" else None
+        return f"h in [{lo:.1f}, {lo + 0.1:.1f})" if row["fault_type"] in ("power_loss", "kt_loss") else None
     if axis == "gait_phase":
         return "stance" if row["stance_at_onset"] == "True" else "swing"
     if axis == "terrain_type":
         return row["terrain_type"]
     if axis == "joint":
         return names[joint]
+    if axis == "leg":
+        return names[joint][:2]
     return None
 
 
@@ -425,7 +469,7 @@ def latency_values(rows: list[dict]) -> np.ndarray:
 def cmd_report(args) -> None:
     exp = args.exp_dir
     runs = load_runs(exp)
-    configs = [(a, o) for o in OBS_SETS for a in ARCHS if (a, o) in runs]
+    configs = run_configs(runs)
     names = fd.read_meta(args.dataset_dir)["joint_names"]
     sets = [k for k in next(iter(runs[configs[0]].values())) if k.startswith("test")]
     label = {c: f"{c[0].upper()} · {c[1]}" for c in configs}
@@ -459,7 +503,7 @@ def cmd_report(args) -> None:
         lines.append(f"| {label[c]} | " + " | ".join(cells) + " |")
 
     analysis_rows = []
-    for axis in ("fault_type", "joint_kind", "front_hind", "power_loss_h", "gait_phase", "terrain_type", "joint"):
+    for axis in ("fault_type", "joint_kind", "front_hind", "health_h", "gait_phase", "terrain_type", "joint", "leg"):
         lines += ["", f"## By {axis} (median latency ms / success joint ≤ 500 ms / success leg ≤ 500 ms; seeds pooled)",
                   ""]  # fmt: skip
         pooled = {c: pooled_rows(exp, c, runs[c]) for c in configs}
@@ -581,7 +625,7 @@ def cmd_compare(args) -> None:
     entries = []
     for label, exp in exps:
         runs = load_runs(exp)
-        for c in [(a, o) for o in OBS_SETS for a in ARCHS if (a, o) in runs]:
+        for c in run_configs(runs):
             entries.append((f"{label}: {c[0].upper()} · {c[1]}", list(runs[c].values()), label, c))
     lines = ["# Comparison at matched false alarms", "",
              f"test_id with input noise; thresholds set on each run's validation split to {MAIN_TARGET} false alarms "

@@ -3,12 +3,15 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Motor power-out / power-loss injector: one random single-joint fault per episode, from a random onset step on.
+"""Motor power-out / power-loss / torque-constant-loss injector: one random single-joint fault per episode, from a
+random onset step on.
 
-* :class:`FaultyDCMotor` scales the DC-motor torque of every joint by a health ``h`` in [0, 1].
+* :class:`FaultyDCMotor` scales the DC-motor torque of every joint by a health ``h`` in [0, 1] and reports the
+  motor-current reading the drive would.
 * :class:`MotorFaultInjector` (an ``interval`` event run every policy step) samples each episode's fault at reset
   and sets ``h``; it owns the schedule and the labels.
-* :func:`motor_fault_labels` exposes the labels as an observation term, so recorders see them next to the inputs.
+* :func:`motor_fault_labels` exposes the labels as an observation term, so recorders see them next to the inputs;
+  :func:`motor_current` does the same for the motor-current reading.
 * :func:`add_motor_faults` wires the three into an env cfg whose robot uses a :class:`DCMotorCfg` actuator group.
 """
 
@@ -25,8 +28,9 @@ from isaaclab.utils import configclass
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-FAULT_TYPES = ("none", "power_out", "power_loss")
-"""Fault-type labels, by index."""
+FAULT_TYPES = ("none", "power_out", "power_loss", "kt_loss")
+"""Fault-type labels, by index. ``kt_loss``: torque constant ``K_t`` down to ``h`` (demagnetized magnets, worn gear);
+the drive still regulates its current to the command, so the current reading does not show ``h``."""
 
 
 @configclass
@@ -48,6 +52,9 @@ class MotorFaultInjectorCfg:
     power_loss_health: tuple[float, float] = (0.1, 0.6)
     """Health ``h`` of a power-loss joint, uniform. Power out is ``h = 0``."""
 
+    kt_loss_health: tuple[float, float] = (0.0, 0.8)
+    """Health ``h`` (``K_t`` / nominal) of a torque-constant-loss joint, uniform."""
+
     passive_damping: float = 0.0
     """Damping ``d`` [N*m*s/rad] of a joint without power (gear friction, back-EMF): ``tau = -d * qdot``."""
 
@@ -61,15 +68,28 @@ class MotorFaultInjectorCfg:
 class FaultyDCMotor(DCMotor):
     r"""DC motor with a per-env, per-joint health :math:`h \in [0, 1]`, written by :class:`MotorFaultInjector`.
 
-    .. math:: \tau = h \cdot \mathrm{clip}_{DC}(\tau_{PD}) - [h = 0]\, d\, \dot q
+    .. math::
 
-    Scaling the output (not the torque limit) leaves a tracking error whenever ``h < 1``, so every faulty sample is
-    observable in principle; a reduced limit would act only while the demand exceeds it.
+        \tau = h \cdot \mathrm{clip}_{DC}(\tau_{PD}) - [h = 0]\, d\, \dot q
+             = \mathrm{clip}(h\, \tau_{PD},\ h\, \tau_{min}(\dot q),\ h\, \tau_{max}(\dot q)) - [h = 0]\, d\, \dot q
+
+    so both the gain and the torque limit (the DC torque-speed curve) shrink by ``h``. Scaling the output (not the
+    limit alone) leaves a tracking error whenever ``h < 1``, so every faulty sample is observable in principle; a
+    reduced limit alone would act only while the demand exceeds it.
+
+    The drive's motor-current reading, in torque units :math:`K_{t,nom}\, i`, is
+    :math:`c \cdot \mathrm{clip}_{DC}(\tau_{PD})` (:attr:`motor_current`): the current loop drives :math:`i` to the
+    command, so ``c = 1`` when the torque constant drops (``kt_loss``), ``c = h`` when the supply limits the current
+    (``power_loss``) and ``c = 0`` without power.
     """
 
     def __init__(self, cfg: DCMotorCfg, *args, **kwargs):
         super().__init__(cfg, *args, **kwargs)
         self.health = torch.ones(self._num_envs, self.num_joints, device=self._device)
+        self.current_health = torch.ones_like(self.health)
+        """Factor ``c`` of the motor-current reading (see the class doc), written by the injector."""
+        self.motor_current = torch.zeros_like(self.health)
+        """Motor-current reading of the last actuator step, in torque units [N*m]."""
         self.passive_damping = 0.0
         self.probe = None
         """Optional callable run at every actuator (PD) step, before the torque is computed: a tap for recorders
@@ -79,6 +99,7 @@ class FaultyDCMotor(DCMotor):
         if self.probe is not None:
             self.probe()
         control_action = super().compute(control_action, joint_pos, joint_vel)
+        self.motor_current = self.current_health * self.applied_effort
         effort = self.health * self.applied_effort - self.passive_damping * (self.health == 0.0) * joint_vel
         self.applied_effort = effort
         control_action.joint_efforts = effort
@@ -120,7 +141,7 @@ class MotorFaultInjector(ManagerTermBase):
         self.onset_range = [round(t / env.step_dt) for t in self.fault_cfg.onset_time_s]
         n = self.num_envs
         self.fault_type = torch.zeros(n, dtype=torch.long, device=self.device)
-        """0 none, 1 power out, 2 power loss."""
+        """Index into :data:`FAULT_TYPES`."""
         self.fault_column = torch.zeros(n, dtype=torch.long, device=self.device)
         """Faulty joint as an actuator column."""
         self.onset_step = torch.full((n,), -1, dtype=torch.long, device=self.device)
@@ -141,10 +162,13 @@ class MotorFaultInjector(ManagerTermBase):
         lo, hi = self.onset_range
         onset = torch.randint(lo, hi + 1, (k,), device=self.device, generator=g)
         self.onset_step[ids] = torch.where(has_fault, onset, -1)
-        lo, hi = cfg.power_loss_health
-        h = lo + (hi - lo) * rand()
+        # one uniform draw for either range, so schedules without kt_loss stay those of earlier datasets
+        u = rand()
+        (lo, hi), (kt_lo, kt_hi) = cfg.power_loss_health, cfg.kt_loss_health
+        h = torch.where(kind == 3, kt_lo + (kt_hi - kt_lo) * u, lo + (hi - lo) * u)
         self.severity[ids] = torch.where(kind == 1, 0.0, h)
         self.actuator.health[ids] = 1.0
+        self.actuator.current_health[ids] = 1.0
         self.observed_health[ids] = 1.0
 
     def __call__(self, env: ManagerBasedRLEnv, env_ids, cfg, actuator: str, asset_name: str = "robot"):
@@ -155,9 +179,13 @@ class MotorFaultInjector(ManagerTermBase):
         ramp = 1.0 if cfg.ramp_steps <= 0 else ((since + 1).float() / cfg.ramp_steps).clamp(max=1.0)
         h = 1.0 - (1.0 - self.severity) * ramp
         health = torch.ones_like(self.actuator.health)
+        current = torch.ones_like(health)
         rows = active.nonzero().squeeze(-1)
         health[rows, self.fault_column[rows]] = h[rows]
+        # the current reading follows h unless only the torque constant dropped (FaultyDCMotor doc)
+        current[rows, self.fault_column[rows]] = torch.where(self.fault_type[rows] == 3, 1.0, h[rows])
         self.actuator.health[:] = health
+        self.actuator.current_health[:] = current
 
     def labels(self) -> torch.Tensor:
         """``[fault_mask (J), fault_type, health (J), onset_step, steps_since_onset, severity]`` per env.
@@ -182,6 +210,15 @@ class MotorFaultInjector(ManagerTermBase):
 def motor_fault_labels(env: ManagerBasedRLEnv, event_name: str = "motor_fault") -> torch.Tensor:
     """Labels of :class:`MotorFaultInjector` (see :meth:`MotorFaultInjector.labels`), shape ``(N, 2 J + 4)``."""
     return env.event_manager.get_term_cfg(event_name).func.labels()
+
+
+def motor_current(env: ManagerBasedRLEnv, event_name: str = "motor_fault") -> torch.Tensor:
+    """Motor-current reading :math:`K_{t,nom}\\, i` [N*m] of the last actuator step, in articulation order (``(N, J)``,
+    0 for joints outside the faulty actuator group); see :class:`FaultyDCMotor`."""
+    injector: MotorFaultInjector = env.event_manager.get_term_cfg(event_name).func
+    out = torch.zeros(env.num_envs, injector.num_joints, device=env.device)
+    out[:, injector.columns] = injector.actuator.motor_current
+    return out
 
 
 def add_motor_faults(

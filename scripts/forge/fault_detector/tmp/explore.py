@@ -402,7 +402,7 @@ def scores(spec, state, cfg, data, device, joint_names, legs, noise: bool) -> np
         net.load_state_dict(state["model"])
         return residual_scores(net, state["sigma"], src, noise)
     model = build(spec, cfg, src, legs).to(device)
-    model.load_state_dict(state["model"])
+    fd.load_state(model, state["model"])
     prob = fd.predict(model, src, noise, seed=1)[0]
     return np.log(np.clip(prob, 1e-7, 1)) - np.log(np.clip(1 - prob, 1e-7, 1))
 

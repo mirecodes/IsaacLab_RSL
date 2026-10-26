@@ -16,7 +16,7 @@ last hit time relative to the event step (seconds, <= 0). Rules are of two kinds
 
 Frames within ``grace_s`` of a spawn are never flagged or used as baseline. Needs only numpy::
 
-    python scripts/forge/fault_analysis/analyze.py <collection> [--baseline <collection> ...]
+    python scripts/forge/surveillance/analyze.py <collection> [--baseline <collection> ...]
 """
 
 import argparse

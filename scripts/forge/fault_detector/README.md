@@ -12,6 +12,7 @@ GRU detectors that output one fault probability per joint from the last $H = 3$ 
 | [test_detector.py](test_detector.py) | torch + numpy | Window boundaries and padding, split, overfit, alarm rule, metrics on synthetic data. |
 | [tmp/explore.py](tmp/explore.py) | torch + numpy | Scratch study: detection within 60 ms (hypotheses and results in [tmp/REPORT.md](tmp/REPORT.md)). |
 | [demo.py](demo.py) | Isaac Lab (Kit window) | Live demo: one robot, a random joint fault per episode, ground truth vs the CJ detector on screen. |
+| [tmp/torque_check.py](tmp/torque_check.py) | Isaac Lab | Does a fault reach the physics? Torque at the actuator vs Newton's `joint_f`, gait and falls per (joint, h). |
 
 ## Usage
 
@@ -67,9 +68,10 @@ euler fetch rsl_rl/a2_study_robust_teacher/2026-10-23_11-54-58_a2_robust_teacher
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--checkpoint` | fetched robust teacher `model_2999.pt` | policy checkpoint |
-| `--detector` | `logs/.../tmp_explore/phase1/CJ_s0`, else the fetched copy | run directory with `checkpoint.pt` and `val.json` |
-| `--fault_types` | `power_loss=1` | e.g. `power_out=0.5 power_loss=0.5` |
+| `--detector` | `logs/.../tmp_explore/phase1/CJ_s0`, else the fetched copy | a `tmp/explore.py` run (`checkpoint.pt`, `val.json`: its rule) or an `experiment.py matrix` run (`checkpoint.pt`, `metrics.json`: its 0.5 / min threshold and debounce); PD rate |
+| `--fault_types` | `power_loss=1` | e.g. `power_out=0.5 power_loss=0.5`; `kt_loss=1` with `--task IsaacContrib-FaultDetector-MotorDegrade-A2Robust` |
 | `--power_loss_health lo hi` | `0.1 0.6` | health $h$ (torque factor) of a power loss; the detector was trained on 0.1–0.6, so e.g. `0.2 0.8` includes weaker faults it never saw |
+| `--kt_loss_health lo hi` | the task's (`0 0.8`) | health $h$ of a torque-constant loss |
 | `--off_s lo hi`, `--on_s lo hi` | `2 5`, `2 5` | healthy / faulty period lengths [s] |
 | `--episode_s` | 20 (`--record`: 40) | episode length [s] |
 | `--fault_seed` | random (printed at start) | repeat a fault sequence |
@@ -271,3 +273,70 @@ policy-rate observation at every $m t$ to float16 precision, `experiment.py sani
   latency) drop furthest. Proprioception cannot reach 0.9 within 60 ms (half the faults barely change the motion
   in that time); a motor-current reading with a joint-shared network reaches 0.957 on `test_id`: see
   [`tmp/REPORT.md`](tmp/REPORT.md).
+
+## kt_loss (2026-10-26, `results/kt_A`, `kt_B`, `kt_compare`)
+
+The user's request: a fault that scales both the gain and the torque limit, as demagnetized magnets or a worn gear
+(lower torque constant $K_t$), $h$ from 0 (motor off) to 0.8, and the v2 comparison repeated on it, with $h \le 0.6$ and
+the harder $h \le 0.8$. Task `IsaacContrib-FaultDetector-MotorDegrade-A2Robust` (`forge/fault_detector/
+motor_degrade_detector/REPORT.md`), fault type `kt_loss` of `forge/fault_injector`.
+
+**Why the walk barely changes** (`tmp/torque_check.py`, 3 robots per case, 5 s of fault after 3 s of walking): the
+torque reaches Newton exactly as computed (sim drive gains 0, max |`joint_f` − actuator output| = 0), and the existing
+power loss already scales gain and limit ($h\,\mathrm{clip}_{DC}(\tau_{PD}) = \mathrm{clip}(h\,\tau_{PD}, \pm h\,
+\tau_{max})$). But the PD demand grows 3–5× as the joint lags (tracking error 2–3×), so at $h = 0.1$ the joint still
+delivers 22–48 % of its healthy torque; walking torques sit far below the 120 / 180 N·m limits. $h = 0$ on one joint
+felled 4 of 12 robots, on all joints 2 of 3 within 0.6 s.
+
+### Decisions (kt_loss)
+
+| Decision | Choice | Reason |
+| --- | --- | --- |
+| Torque law | unchanged ($\tau = h\,\mathrm{clip}_{DC}(\tau_{PD})$) | identical to the requested $\mathrm{clip}(h\,\tau_{PD}, \pm h\,\tau_{max})$ |
+| Motor current | `motor_current` = $K_{t,nom}\,i = \mathrm{clip}_{DC}(\tau_{PD})$ of the previous PD substep, ±1 N·m noise | the user's choice: what the drive reports; its current loop holds $i$ at the command, so $h$ is invisible to it. The CJ tier of `tmp/` read $h\,\tau$ instead (a torque sensor), which is why it found faults within 5–20 ms |
+| Data | `data_kt/main_pd` 17,104 episodes, `test_id_pd` 4,230 (seed 1); 68 % faulty, $h \sim U[0, 0.8]$ | the v2 recipe (PD rate) with the new fault |
+| A / B | A trains, validates and tests on nominal + $h \le 0.6$ episodes (`max_health=0.6`), B on all | the user's choice: each range trained and scored on its own |
+| Ablation | `proprio` vs `proprio_current` (+12 inputs per sample); MLP and GRU; 3 seeds | the user's request |
+| Recipe | v2: H = 5 policy steps (20 PD samples), 80 ms grace, 5 HNM epochs, thresholds on val at 0.5 / min | comparable with v2 |
+| GRU inference | batches of 8192 windows (32768 for the MLP) | cuDNN's GRU workspace for 32k windows ran out of the 24 GB GPU next to B's data |
+
+Checks: `experiment.py sanity` on both sets: labels match, and at every PD sample the applied torque equals
+$h \times$ `motor_current` on the faulty joint and `motor_current` elsewhere (max error 7e-4, float16; 280 M samples).
+
+### Results (test_id, noise on, 0.5 / min, mean ± std over 3 seeds)
+
+| Config | A ($h \le 0.6$): success joint / leg ≤ 500 ms | A median latency | A miss | B ($h \le 0.8$): success joint / leg | B median latency | B miss | FA / min (A / B) |
+|---|---|---|---|---|---|---|---|
+| MLP · proprio | 0.760 / 0.761 | 213 ms | 0.033 | 0.642 / 0.643 | 237 ms | 0.119 | 0.38 / 0.49 |
+| GRU · proprio | 0.685 / 0.686 | 287 ms | 0.045 | 0.585 / 0.586 | 310 ms | 0.128 | 0.59 / 0.63 |
+| **MLP · proprio + current** | **0.844 / 0.845** | **153 ms** | 0.016 | **0.735 / 0.735** | **178 ms** | 0.066 | 0.42 / 0.47 |
+| GRU · proprio + current | 0.808 / 0.809 | 190 ms | 0.016 | 0.691 / 0.691 | 227 ms | 0.065 | 0.51 / 0.59 |
+
+By $h$ (MLP · proprio + current, seeds pooled; success joint ≤ 500 ms / median latency):
+
+| $h$ | [0, 0.1) | [0.1, 0.2) | [0.2, 0.3) | [0.3, 0.4) | [0.4, 0.5) | [0.5, 0.6) | [0.6, 0.7) | [0.7, 0.8) |
+|---|---|---|---|---|---|---|---|---|
+| A | 0.96 / 90 | 0.96 / 110 | 0.94 / 125 | 0.86 / 165 | 0.82 / 220 | 0.55 / 400 | – | – |
+| B | 0.97 / 95 | 0.96 / 110 | 0.94 / 120 | 0.88 / 155 | 0.84 / 200 | 0.63 / 290 | 0.43 / 622 | 0.22 / 1330 |
+| B, MLP · proprio | 0.93 / 125 | 0.90 / 155 | 0.89 / 170 | 0.75 / 222 | 0.68 / 295 | 0.50 / 395 | 0.31 / 852 | 0.14 / 1548 |
+
+By leg (success joint ≤ 500 ms, MLP · proprio + current): A FL 0.79, FR 0.84, RL 0.88, RR 0.86; B 0.63, 0.69, 0.82,
+0.79.
+
+- **The motor current helps although it does not carry $h$**: +8.4 pt in A (+9.3 in B), 60 ms faster, half the
+  misses. It is the PD command, i.e. the tracking error $q^\ast - q$, which proprioception lacks (the CPG action is not
+  the joint target); a lagging joint shows as a growing command at once. An MLP with the tracking error instead of the
+  current (`extra_terms=["tracking_error"]`, `results/kt_A_te`, `kt_B_te`) recovers about half of the gain: A 0.806 /
+  180 ms, B 0.697 / 203 ms (proprio 0.760 / 0.642, + current 0.844 / 0.735). The rest is the command itself:
+  $K_p e - K_d \dot q$ with per-joint gains and the DC saturation, which the network would have to learn from $e$ and
+  $\dot q$ (each with its own noise).
+- **MLP beats GRU** in every cell (+3.6 to +7.5 pt, 37–74 ms faster), as in v2; the GRU also runs over its
+  false-alarm target on the test set (0.59–0.63 / min).
+- **B is harder only through its weak faults**: on $h < 0.6$ the B models match or beat the A models (e.g. [0.5, 0.6):
+  0.63 vs 0.55), so training on weaker faults costs nothing; B's overall drop comes from $h \ge 0.6$, where 0.43 / 0.22
+  are found within 500 ms (the robot hardly notices a 30 % torque loss, see the torque check).
+- **Joint vs leg**: the diagnosis at the alarm is right for 0.97–0.99 (joint) / 0.97–0.99 (leg), so the two success
+  rates coincide; misses are late detections. Front legs stay harder than hind legs, hip and thigh harder than knee.
+- **Renders** (`euler -p isaaclab3 fetch fault_detector/demo`, same fault seed 1144512330, MLP · proprio + current
+  seed 0): `2026-10-26_kt_A_h0-0.6` and `2026-10-26_kt_B_h0-0.8`, 6 faults each, all found on the right joint
+  (A 55–205 ms, B 60–295 ms), no false alarm.

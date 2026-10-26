@@ -15,21 +15,79 @@ These scripts play a trained RSL-RL locomotion policy on many robots in parallel
 ### Campaign on the terrain maps
 
 ```bash
-python scripts/forge/fault_analysis/campaign.py enqueue --name terrain_v1    # 2 policies x 9 terrains = 18 jobs
+python scripts/forge/surveillance/campaign.py enqueue --name v1    # 2 policies x 10 terrains = 20 jobs
 euler status                                                                 # jobs run one after another
-euler fetch fault_analysis/terrain_v1
-python scripts/forge/fault_analysis/campaign.py report results/euler/isaaclab3/fault_analysis/terrain_v1
+euler fetch surveillance/v1
+python scripts/forge/surveillance/campaign.py report results/euler/isaaclab3/surveillance/v1
 ```
 
-Each job plays `IsaacContrib-Velocity-A2Deploy-<Type>-{Robust,Energy}` (`forge/velocity/a2_deploy`; robust teacher
+Each job plays `IsaacContrib-Surveillance-<Type>-{Robust,Energy}` (`forge/surveillance`; robust teacher
 `model_2999`, energy teacher rough `model_2999`): the terrain map's difficulty rows 1–3 (d = 0.4, 0.55, 0.7;
 inclines 0, 11.25, 22.5°), 20 robots that start every episode on a random tile, forward-only commands with smooth
 turns of at most ±45° (robust policy; the energy policy has no command input). On the inclines (`rough_slope`,
-`rough_stairs`, `slip_slope`) the robots face straight up or down the slope (±15°) and get no turn command. It stops at 200 falls or 30 min of
-sim time, then renders 10 falls spread evenly over the play. `report` writes `report.md` into the campaign directory: per (policy, terrain, difficulty row) the
-episodes, successes, falls, success rate, mean episode length, mean time to fall, and the play's sim and wall time.
-`enqueue` options: `--policies`, `--terrains`, `--failures` 200, `--minutes` 30, `--videos` 10, `--dry_run` (print
-the `euler` commands only).
+`rough_stairs`, `slip_slope`) the robots face straight up or down the slope (±15°) and get no turn command. The
+terrain types are `forge/terrain`'s 9 plus `slip_field`, which is rough_field with random foot slips. On slip
+terrain the foot friction is drawn at every touchdown (`forge/terrain` default): low with 2 %, back to 0.8 at the
+next touchdown (see `forge/surveillance/REPORT.md` §3.4). It stops at
+100 falls or 10 min of sim time.
+
+Besides the falls, it saves up to 100 **event-trigger windows** into `triggers/`, to check that the terrain events
+fire. They are 5 s, like the falls, centered on the trigger (2.5 s before, 2.5 s after), and spread evenly over the
+10 min (at most `100 · t / 10 min` by sim time t). They do not stop the play. The trigger is the task's
+`event_trigger` (`forge/surveillance/mdp/triggers.py`):
+
+| Terrain | Trigger | Fires when |
+| --- | --- | --- |
+| `crust_collapse` | `crust_collapse` | the crust patch under a foot collapses |
+| `sand_field` | `sand_sink` | a foot sinks into soft sand (below the patch surface, the terrain's drag rule) |
+| `gravel_field` | `stone_step` | a loaded foot (> 1 N) stands on a stone: within its circle bound and 2 cm above the ground |
+| `slip_slope`, `slip_field` | `foot_slip` | a foot that touched down with a low friction (2 % of the touchdowns) is loaded |
+| the others | `random_walk` | at random (once per 5 s per robot on average): normal walking, no event |
+
+A trigger window starts on the trigger's rising edge, at most one per robot per 5 s, and only when the robot has
+2.5 s of history. A window cut short by a reset is dropped; a fall inside it is already a failure event.
+
+Then it renders 10 falls and 10 trigger windows, each spread evenly over the play (`videos/`, `triggers/videos/`).
+`report` writes `report.md` into the campaign directory. Per (policy, terrain, difficulty row) it lists the
+episodes, successes, falls, success rate, mean episode length, mean time to fall, the play's sim and wall time, and
+the trigger name, trigger windows and their videos. `enqueue` options: `--policies`, `--terrains`, `--failures` 100,
+`--minutes` 10, `--triggers` 100 (0: none), `--videos` 10, `--dry_run` (print the `euler` commands only).
+
+### Running campaign `v2` (event triggers; run 2026-10-26, results in REPORT.md §5.2)
+
+The event-trigger code was smoke-tested first (`smoke_trig`, passed). To repeat, from the repo root on the
+Mac. The Euler queue is shared and runs FIFO; if the user holds a node, enqueue on its profile.
+
+```bash
+# 1. smoke: 4 jobs (slip_field is new), 1 min sim each, 10 trigger windows, 2 + 2 videos
+python scripts/forge/surveillance/campaign.py enqueue --name smoke_trig --policies Robust \
+    --terrains crust_collapse sand_field gravel_field slip_field --minutes 1 --triggers 10 --videos 2
+euler status
+euler fetch surveillance/smoke_trig
+python scripts/forge/surveillance/campaign.py report results/euler/isaaclab3/surveillance/smoke_trig
+```
+
+Check, per terrain:
+
+- `summary.json`: `num_envs` 20; `event_trigger` is `crust_collapse` / `sand_sink` / `stone_step` / `foot_slip` / `random_walk`.
+- `triggers/index.csv` has rows with `num_frames` 250.
+- In `triggers/videos/`, the event happens at the middle (2.5 s): a foot sinking, a stone underfoot, a crust giving
+  way.
+
+If `stone_step`, `sand_sink` or `foot_slip` gives no rows, the trigger (`forge/surveillance/mdp/triggers.py`) needs fixing; the
+falls are recorded either way.
+
+```bash
+# 2. full campaign: 2 policies x 10 terrains = 20 jobs, each 10 min sim or 100 falls, 100 trigger windows
+python scripts/forge/surveillance/campaign.py enqueue --name v2
+euler fetch surveillance/v2
+python scripts/forge/surveillance/campaign.py report results/euler/isaaclab3/surveillance/v2
+# optional: rule flags on the falls of one collection
+uv run --no-project --with numpy python scripts/forge/surveillance/analyze.py \
+    results/euler/isaaclab3/surveillance/v2/Robust/slip_slope
+```
+
+Record the results in `forge/surveillance/REPORT.md` §5 (a new §5.2, set up as §5.1) and in **Collections** below.
 
 ### Single collections
 
@@ -37,13 +95,13 @@ On Euler (the container's cwd is the repo root, and `logs/` is the profile's log
 
 ```bash
 # collect: 4096 robots by default; stops at --max_events events or --max_steps env steps
-euler enqueue fault_a2_robust -- python scripts/forge/fault_analysis/collect.py \
+euler enqueue fault_a2_robust -- python scripts/forge/surveillance/collect.py \
     --task IsaacContrib-Velocity-A2Study-RobustTeacher \
     --checkpoint /workspace/isaaclab/logs/rsl_rl/a2_study_robust_teacher/2026-10-23_11-54-58_a2_robust_teacher_s0/model_2999.pt \
     --max_events 2000
 
 # render selected events (default: all) of one collection
-euler enqueue fault_render -- python scripts/forge/fault_analysis/render.py \
+euler enqueue fault_render -- python scripts/forge/surveillance/render.py \
     /workspace/isaaclab/logs/fault_analysis/a2_study_robust_teacher/<collection> --events 0 5 12
 
 euler fetch fault_analysis   # -> results/euler/isaaclab3/fault_analysis/... (events, terrain, videos)
@@ -52,7 +110,7 @@ euler fetch fault_analysis   # -> results/euler/isaaclab3/fault_analysis/... (ev
 Replay on the Linux machine, in the local Isaac container. `docker-compose.codes.yaml` mounts `~/hyeslee/results` at `/workspace/results`:
 
 ```bash
-python scripts/forge/fault_analysis/render.py \
+python scripts/forge/surveillance/render.py \
     /workspace/results/euler/isaaclab3/fault_analysis/a2_study_robust_teacher/<collection> \
     --events 12 --viz kit --real_time   # live window at wall-clock speed; the mp4 is written too
 ```
@@ -65,15 +123,16 @@ python scripts/forge/fault_analysis/render.py \
 | `--max_events` / `--max_steps` | 1000 / none | When to stop. |
 | `--terminations` | `base_contact` | Failure terms kept; the task's others (e.g. `bad_orientation`) are removed. Time-outs stay. |
 | `--contact_onsets` | off | Also record the onset of a non-foot contact as an event (the robot keeps walking). |
+| `--max_triggers` | 0 | Also save up to this many event-trigger windows into `triggers/` (tasks with `event_trigger`); paced over `--max_steps`. |
 | `--foot_bodies` | `.*_foot` | Regex for the foot bodies. With `--contact_onsets`, contact on any other body is an event. |
 | `--contact_threshold` | 1.0 | Trigger force [N], the same as the stock `base_contact` termination. |
 | `--grace_s` | 1.0 | Contact onsets this soon after a (re)spawn are ignored: the reset pose often puts a calf on the ground. |
 | `--disturbances` | off | Keep the task's random pushes and external wrench. |
 | `--sub_terrains` | all | Keep only these sub-terrains of the task's generator, e.g. `hills rough_discrete` (heightfield rough ground, no blocks or stairs). |
-| `--output_dir` | `logs/fault_analysis/<experiment>/<time>_<run>_<model>` | Where the collection is written. |
+| `--output_dir` | `logs/surveillance/<experiment>/<time>_<run>_<model>` | Where the collection is written. |
 | `--num_envs`, `--seed`, `--checkpoint`, … | | Same as `play.py`. `--num_envs` defaults to the task's. |
 
-`render.py` takes the collection directory, `--events <ids>` or `--pick N` (N full-window failures nearest to N evenly spaced sim times), `--eye dx dy dz` (camera offset from the base, default `-1 -1 0.6` m), `--real_time`, and `--viz` like `play.py`. It reapplies the collection's `--sub_terrains` and seed, so it needs no other arguments.
+`render.py` takes the collection directory, `--triggers` (render the trigger windows instead of the failures), `--events <ids>` or `--pick N` (N full-window failures nearest to N evenly spaced sim times), `--eye dx dy dz` (camera offset from the base, default `-1 -1 0.6` m), `--real_time`, and `--viz` like `play.py`. It reapplies the collection's `--sub_terrains` and seed, so it needs no other arguments.
 
 Run both scripts as queued jobs (`euler enqueue`), not `euler exec`: an `exec` step got OOM-killed on host memory where the same queued command ran fine.
 
@@ -82,9 +141,9 @@ Flag the rules on a fetched collection. Any Python with numpy works (the Isaac c
 ```bash
 R=results/euler/isaaclab3/fault_analysis
 # thresholds from normal walking: frames >= 2 s before the leg-contact onsets of the smoke collection
-python scripts/forge/fault_analysis/analyze.py $R/smoke/rough2
+python scripts/forge/surveillance/analyze.py $R/smoke/rough2
 # flag the failures against those thresholds
-python scripts/forge/fault_analysis/analyze.py $R/a2_study_robust_teacher/2026-10-24_rough_terminal \
+python scripts/forge/surveillance/analyze.py $R/a2_study_robust_teacher/2026-10-24_rough_terminal \
     --thresholds $R/smoke/rough2/thresholds.json
 ```
 
@@ -105,7 +164,7 @@ It writes `flags.csv` and `thresholds.json` into the collection, and prints the 
 import json
 import sys
 
-sys.path.insert(0, "scripts/forge/fault_analysis")
+sys.path.insert(0, "scripts/forge/surveillance")
 import analyze
 
 meta, rows = analyze.load_collection(c)
@@ -116,10 +175,13 @@ masks["B_value_drop"]  # [T] bool; the last frame is the event step
 
 ## Collections
 
-The collections below were deleted on 2026-10-25 (Euler and local); only the results quoted here remain. They used the old trigger (task terminations including tilt, plus leg-contact onsets).
+Except `terrain_v1`, the collections below were deleted on 2026-10-25 (Euler and local); only the results quoted here remain. They used the old trigger (task terminations including tilt, plus leg-contact onsets).
 
 | Collection (under `logs/fault_analysis/`) | Setup | Content |
 | --- | --- | --- |
+| `logs/surveillance/v2/<Policy>/<terrain>` | the trigger campaign, 2 policies x 10 terrains, 20 robots, 10 min (2026-10-26) | 25 falls (Robust 6, Energy 19), 2000 trigger windows, 400 videos; results in `forge/surveillance/REPORT.md` §5.2 |
+| `logs/surveillance/smoke_trig/Robust/<terrain>` | smoke test of `v2`: crust_collapse, sand_field, gravel_field, rough_field, 1 min | 0 falls, 10 trigger windows each (all 250 frames) |
+| `terrain_v1/<Policy>/<terrain>` | the deploy campaign, 2 policies x 9 terrains, 20 robots, 30 min or 200 falls (2026-10-25; kept) | 421 falls in total; Robust: 200 on `slip_slope`, 59 on `gravel_field`, 1 elsewhere; results in `forge/surveillance/REPORT.md` §5.1 |
 | `a2_study_robust_teacher/2026-10-24_rough_terminal` | A2 robust teacher `model_2999`, `--sub_terrains hills rough_discrete`, 4096 robots, `--terminal_only` | 300 failures in 460 s sim (523 robot-h, ≈0.57 failures per robot-h, 7 min wall); videos of the first 10 full-window events |
 | `harsh_world/v5_robust_full_40` | A2 robust teacher `model_2999`, `IsaacContrib-Velocity-A2HarshWorld-Robust-Full` (10 properties × 3 difficulties), 40 robots (4 per property; row d = 0.4 gets 2, the others 1), 30 min sim | 6136 events: 645 failures (606 tilt, 39 base contact) and 5491 leg-contact onsets, 22 min wall. 95 % of the failures on `slip_slope` 229, `mesa_drop` 216, `rough_slope` 168; none on `stub_field`, `crust_collapse`. Flagged with its own baseline |
 | `smoke/rough2` | same terrain, 1024 robots, 30 s, contact onsets too | 3418 leg-contact onsets and 6 failures; videos of events 100, 500 (contact) and 1264, 1291, 1788 (failures) |
@@ -146,6 +208,8 @@ Every file of a collection lives in one directory:
   events/<id>.npz  one event: [T, ...] arrays per field (T <= 250 at 50 Hz), plus env_id, step,
                    env_origin, terrain_level, terrain_type, terminations, contact_bodies
   videos/<id>.mp4  written by render.py
+  triggers/        the event-trigger windows (--max_triggers): index.csv, events/<id>.npz and videos/ as above;
+                   centered windows (the trigger step is frame T/2 - 1 of T = 250), terminal normally False
   flags.csv        written by analyze.py: per event and rule, hit (0/1) and first / last hit time [s, <= 0]
   thresholds.json  written by analyze.py: the fixed parameters and baseline thresholds used for flags.csv
 ```
@@ -262,7 +326,10 @@ Choices the request left open, and how they were made here:
 
 ## Changelog
 
-- 2026-10-25: Trigger is base contact only (`--terminations`, default `base_contact`; `--contact_onsets` replaces `--terminal_only`). `episodes.csv`, `summary.json`, `left_tile`, and kept terrain-map curricula in `collect.py` (`--num_envs` now defaults to the task's); `render.py --pick`; `analyze.py --rules`; `campaign.py` on the new deploy tasks (`forge/velocity/a2_deploy`). Scripts moved from `scripts/reinforcement_learning/` to `scripts/forge/`. Reason: the user's request (success rates per difficulty on the terrain maps, rules turned on one at a time during analysis).
+- 2026-10-26: `slip_field` (10 terrain types; `campaign.py` reads `EXTRA_TERRAINS` of `forge/surveillance`). Reason: the user's request.
+- 2026-10-26: Event-trigger windows (`--max_triggers`, `triggers/`, `render.py --triggers`); campaign defaults 20 robots, 10 min, 100 falls, 100 trigger windows, 10 + 10 videos. Reason: the user's request (check that the terrain events fire, apart from the falls).
+- 2026-10-26: Moved to `scripts/forge/surveillance` with the task (`forge/surveillance`, `IsaacContrib-Surveillance-*`); collections now under `logs/surveillance/`; campaign defaults 100 falls, 10 robots. The campaign `terrain_v1` (20 robots, 200 falls) stays under `logs/fault_analysis/terrain_v1`. Reason: the user's request.
+- 2026-10-25: Trigger is base contact only (`--terminations`, default `base_contact`; `--contact_onsets` replaces `--terminal_only`). `episodes.csv`, `summary.json`, `left_tile`, and kept terrain-map curricula in `collect.py` (`--num_envs` now defaults to the task's); `render.py --pick`; `analyze.py --rules`; `campaign.py` on the new deploy tasks (`forge/surveillance`). Scripts moved from `scripts/reinforcement_learning/` to `scripts/forge/`. Reason: the user's request (success rates per difficulty on the terrain maps, rules turned on one at a time during analysis).
 
 - 2026-10-24: `analyze.py` flags the rules A–E on saved windows (`flags.csv`, `thresholds.json`), with baseline percentiles from normal walking; flagged `2026-10-24_rough_terminal` against `smoke/rough2`.
 - 2026-10-24: Collected `2026-10-24_rough_terminal`. `render.py` gained `--count`, a closer default camera, and hidden command markers.

@@ -61,7 +61,8 @@ def default_terrains() -> dict:
 
 @configclass
 class SlipCfg:
-    """Foot friction on ``slip`` terrain (sampled once when a foot enters the map, i.e. at spawn)."""
+    """Foot friction on ``slip`` terrain: drawn at every touchdown, low with ``slip_prob``, so a slip is a rare random
+    event that lasts one stance and the next touchdown restores the friction."""
 
     mu_nominal: float = 0.8
     """Foot friction off slip terrain and after leaving it: A2's material value in the base task."""
@@ -69,11 +70,12 @@ class SlipCfg:
     """Low-friction range at difficulty 0."""
     mu_slip_hard: tuple[float, float] = (0.03, 0.25)
     """Low-friction range at difficulty 1 (bounds interpolated in between)."""
-    slip_prob: float = 0.75
-    """Probability that an entering foot gets a low-friction sample (spec 0.5: the slide on ``slip_slope`` was only
-    2.6x the rigid twin's, below the spec's 3x)."""
-    resample_on_touchdown: bool = False
-    """Re-draw at every touchdown instead of once per entry."""
+    slip_prob: float = 0.02
+    """Probability that a touchdown (or a foot entering the map) gets a low-friction sample: about one slip per robot
+    every 6 s at 2 touchdowns per foot and second. Was 0.75 once per foot and episode (spec 0.5), tuned for the T3
+    slide ratio; the user asked for rare random slips instead (2026-10-26)."""
+    resample_on_touchdown: bool = True
+    """Re-draw at every touchdown; False draws once per entry (in practice once per foot and episode)."""
     observe_slip: bool = False
     """Whether the policy's privileged friction input reports the applied friction (True) or the nominal one."""
     ground_mu: float = 0.02

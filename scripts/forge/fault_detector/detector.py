@@ -40,11 +40,13 @@ INPUTS = {
     "imu_lin_acc": ("analysis/imu_lin_acc", None, None, 0.0),
     # q* - q, from the recorded target and position (both relative to the default pose)
     "tracking_error": ("analysis/joint_pos_target", "pd/joint_pos_target", None, 0.01),
+    # the drive's current reading K_t,nom i [N m] (MotorDegrade task); noise as tmp/explore.py's torque reading
+    "motor_current": ("analysis/motor_current", "pd/motor_current", None, 1.0),
 }
 PROPRIO = ["base_ang_vel", "projected_gravity", "joint_pos_rel", "joint_vel", "last_action", "velocity_command"]
 PRIV = ["base_height", "base_lin_vel_xy"]
 SIZES = {"small": ([128, 64], 64), "medium": ([256, 128], 128), "large": ([512, 256, 128], 256)}
-FAULT_TYPES = ("none", "power_out", "power_loss")
+FAULT_TYPES = ("none", "power_out", "power_loss", "kt_loss")
 LEGS = ("FL", "FR", "RL", "RR")
 
 
@@ -56,9 +58,10 @@ class DetectorCfg:
     dataset_dir: str = "logs/fault_detector/data/main"
     test_dirs: tuple = ("logs/fault_detector/data/test_id", "logs/fault_detector/data/test_ood")
     split: tuple = (0.8, 0.1, 0.1)
+    max_health: float = 1.0  # keep only faulty episodes with h <= this (and every nominal one), in every set
     rate: str = "policy"  # "policy" (50 Hz samples) | "pd" (200 Hz, the actuator rate; needs collect.py --pd_rate)
     # -- input
-    obs_set: str = "proprio"  # "proprio" | "proprio_priv"
+    obs_set: str = "proprio"  # "proprio" | "proprio_priv" | "proprio_current" (+ motor current)
     extra_terms: tuple = ()  # e.g. ("tracking_error",), ("imu_lin_acc",)
     history_length: int = 3  # in policy steps (20 ms each); x 4 samples at the PD rate
     clip: float = 10.0
@@ -95,7 +98,8 @@ class DetectorCfg:
 
     @property
     def inputs(self) -> list[str]:
-        return PROPRIO + (PRIV if self.obs_set == "proprio_priv" else []) + list(self.extra_terms)
+        extra = {"proprio_priv": PRIV, "proprio_current": ["motor_current"]}.get(self.obs_set, [])
+        return PROPRIO + extra + list(self.extra_terms)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -110,6 +114,11 @@ def read_index(dataset_dir: str) -> list[dict]:
 def read_meta(dataset_dir: str) -> dict:
     with open(os.path.join(dataset_dir, "meta.json")) as f:
         return json.load(f)
+
+
+def within_health(index: list[dict], max_health: float) -> list[dict]:
+    """The nominal episodes and the faulty ones with ``h <= max_health``."""
+    return [r for r in index if not int(r["has_fault"]) or float(r["health"]) <= max_health]
 
 
 def index_hash(dataset_dir: str) -> str:
@@ -305,13 +314,14 @@ def sampling_cdf(src: WindowSource, cfg: DetectorCfg, nominal_weight: torch.Tens
     num_joints = src.mask.shape[1]
     faulty = src.mask.any(dim=1)
     joint = src.mask.argmax(dim=1)
-    group = torch.where(faulty, joint * 2 + (src.ftype - 1).clamp(min=0) + 1, 0)  # 0 nominal, 1.. combos
+    num_types = len(FAULT_TYPES) - 1
+    group = torch.where(faulty, joint * num_types + (src.ftype - 1).clamp(min=0) + 1, 0)  # 0 nominal, 1.. combos
     w = torch.ones(len(src.t), device=src.device, dtype=torch.float64)
     w[faulty & (src.since < src.seconds(cfg.onset_window_s))] = cfg.onset_oversample
     if nominal_weight is not None:
         w = torch.where(faulty, w, w * nominal_weight.double())
     w[src.t < src.seconds(cfg.skip_initial_s)] = 0.0
-    group_sum = torch.zeros(2 * num_joints + 1, device=src.device, dtype=torch.float64).index_add_(0, group, w)
+    group_sum = torch.zeros(num_types * num_joints + 1, device=src.device, dtype=torch.float64).index_add_(0, group, w)
     present = (group_sum[1:] > 0).sum().clamp(min=1)
     target = torch.full_like(group_sum, cfg.fault_ratio / present.item())
     target[0] = 1.0 - cfg.fault_ratio
@@ -369,9 +379,15 @@ def num_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+def eval_batch(model: nn.Module, batch: int = 32768) -> int:
+    """Windows per inference batch: cuDNN's GRU workspace for 32k windows (~5 GB) no longer fits next to the kt_loss
+    sets on a 24 GB GPU (``tmp/explore.py`` passes its own models, without ``arch``)."""
+    return min(batch, 8192) if getattr(model, "arch", None) == "gru" else batch
+
+
 def chunked(model: Detector, x: torch.Tensor, batch: int = 32768):
     """``model(x)`` in batches (a GRU's workspace for a whole validation set exceeds the GPU)."""
-    outs = [model(part) for part in x.split(batch)]
+    outs = [model(part) for part in x.split(eval_batch(model, batch))]
     types = [t for _, t in outs]
     return torch.cat([j for j, _ in outs]), (torch.cat(types) if types[0] is not None else None)
 
@@ -393,6 +409,7 @@ def loss_fn(model: Detector, cfg: DetectorCfg, x, mask, ftype, since, grace: int
 def predict(model: Detector, src: WindowSource, noise: bool, seed: int = 0, batch: int = 32768, rows=None):
     """Joint probabilities [S, J] and type probabilities [S, 3] at every row of ``src`` (or the given rows)."""
     model.eval()
+    batch = eval_batch(model, batch)
     g = torch.Generator(device=src.device).manual_seed(seed)
     rows = torch.arange(len(src.t), device=src.device) if rows is None else rows
     probs, types = [], []
@@ -509,8 +526,17 @@ def load_detector(checkpoint: dict, device: str) -> tuple[Detector, DetectorCfg]
     cfg = DetectorCfg(**saved)
     window = checkpoint.get("window", cfg.history_length)
     model = Detector(cfg, checkpoint["input_dim"], checkpoint["num_joints"], window).to(device)
-    model.load_state_dict(checkpoint["model"])
+    load_state(model, checkpoint["model"])
     return model.eval(), cfg
+
+
+def load_state(model: nn.Module, state: dict) -> None:
+    """``model.load_state_dict(state)``, with the type head resized to the checkpoint's (3 types before kt_loss)."""
+    weight = state.get("type_head.weight")
+    if weight is not None and getattr(model, "type_head", None) is not None:
+        if weight.shape != model.type_head.weight.shape:
+            model.type_head = nn.Linear(weight.shape[1], weight.shape[0]).to(model.type_head.weight.device)
+    model.load_state_dict(state)
 
 
 # ---------------------------------------------------------------------------------------------------------------------

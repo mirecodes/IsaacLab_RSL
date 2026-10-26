@@ -6,9 +6,10 @@
 """Play the frozen policy with the motor-fault injector and save every finished episode for the detector.
 
 Every policy step stores the noiseless ``detector``, ``privileged``, ``analysis`` and ``fault`` observation groups of
-``IsaacContrib-FaultDetector-MotorFailure-A2Robust`` (see its ``REPORT.md``). Episodes are written as shards
-``shards/<n>.npz`` (one ``<group>/<term>`` array of shape (sum of episode lengths, dim) per term, plus ``ep_len``
-and ``episode_id``) and listed in ``index.csv``; ``meta.json`` holds term dims, joint names and the run's arguments.
+``IsaacContrib-FaultDetector-MotorFailure-A2Robust`` or ``-MotorDegrade-A2Robust`` (see their ``REPORT.md``).
+Episodes are written as shards ``shards/<n>.npz`` (one ``<group>/<term>`` array of shape (sum of episode lengths,
+dim) per term, plus ``ep_len`` and ``episode_id``) and listed in ``index.csv``; ``meta.json`` holds term dims, joint
+names and the run's arguments.
 With ``--pd_rate``, ``pd/<name>`` arrays (float16, decimation x the steps) also hold the state at every actuator (PD)
 step, sampled by the faulty actuator's probe (see :class:`EpisodeWriter`).
 Runs headless until ``--num_episodes`` episodes have finished, e.g. on Euler::
@@ -43,6 +44,7 @@ from isaaclab_rl.entrypoints.backends.play_rsl_rl import _parse_args, _resolve_c
 from isaaclab_rl.entrypoints.common import apply_env_overrides, close_env, create_isaaclab_env  # noqa: E402
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper  # noqa: E402
 
+from isaaclab_tasks.forge.fault_injector.injector import motor_current  # noqa: E402
 from isaaclab_tasks.utils import resolve_task_config  # noqa: E402
 
 GROUPS = ("detector", "privileged", "analysis", "fault")
@@ -76,6 +78,8 @@ def pd_sample(env) -> dict[str, torch.Tensor]:
         "joint_pos_target": d.joint_pos_target.torch - d.default_joint_pos.torch,
         # torque of the previous substep (incl. the fault's health): a motor-current reading one PD period old
         "applied_torque": d.applied_torque.torch,
+        # the drive's motor-current reading K_t,nom i of the previous substep (blind to a torque-constant loss)
+        "motor_current": motor_current(env),
         # the action being executed in this policy step
         "last_action": env.action_manager.action,
         "velocity_command": env.command_manager.get_command("base_velocity"),
@@ -220,6 +224,7 @@ def main() -> None:
     parser.add_argument("--p_fault", type=float, default=None, help="Override the fault probability.")
     parser.add_argument("--fault_types", nargs="+", default=None, help="Override, e.g. power_out=0.5 power_loss=0.5.")
     parser.add_argument("--power_loss_health", type=float, nargs=2, default=None, help="Override the h range.")
+    parser.add_argument("--kt_loss_health", type=float, nargs=2, default=None, help="Override the kt_loss h range.")
     parser.add_argument("--passive_damping", type=float, default=None, help="Override d [N*m*s/rad].")
     parser.add_argument("--pd_rate", action="store_true", help="Also store the state at every actuator (PD) step.")
     fd_args, argv = parser.parse_known_args(sys.argv[1:])
@@ -239,6 +244,8 @@ def main() -> None:
             fault_cfg.fault_types = {k: float(v) for k, v in (s.split("=") for s in fd_args.fault_types)}
         if fd_args.power_loss_health is not None:
             fault_cfg.power_loss_health = tuple(fd_args.power_loss_health)
+        if fd_args.kt_loss_health is not None:
+            fault_cfg.kt_loss_health = tuple(fd_args.kt_loss_health)
         if fd_args.passive_damping is not None:
             fault_cfg.passive_damping = fd_args.passive_damping
 

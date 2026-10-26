@@ -11,7 +11,7 @@
 Terrain-generation algorithms ("templates") for observing failures of trained policies. A task's map holds one
 terrain type: 5 difficulty rows x 5 tiles, each tile with its own random layout. A trained A2 policy
 walks it under random commands; its observations and actions are untouched, so its checkpoint loads as it is.
-Failure analysis is left to `scripts/forge/fault_analysis` (`collect.py`, `analyze.py`,
+Failure analysis is left to `scripts/forge/surveillance` (`collect.py`, `analyze.py`,
 `render.py`), which takes these tasks like any other task with a generated terrain.
 
 Until 2026-10-24 this was the "Harsh World" (`velocity/a2_harsh_world`): all ten types side by side on one map, with
@@ -136,10 +136,12 @@ feet use Newton's force-space contact (`mujoco.solref_mode = FORCE_SPACE`), so a
 stiffness and friction (0.6). A slab is a static box from the sand surface 0.6 m down (through the hardpan), so a
 sinking foot meets the hardpan before it could be pushed out of the box.
 
-**Slip** (zone `slip`). Per foot, on entering the tile grid (in practice at spawn): with probability `slip_prob` =
-0.75, `μ ~ U(lo(d), hi(d))` with `[lo, hi]` interpolated from (0.05, 0.35) at d = 0 to (0.03, 0.25) at d = 1, else
-`μ_nominal` = 0.8; kept while on the grid (`resample_on_touchdown` redraws at every touchdown), `μ_nominal` again on
-leaving it or on reset. Only the changed environments' foot shapes are written.
+**Slip** (zone `slip`). Per foot, at every touchdown on the tile grid (`resample_on_touchdown`) and on entering
+it: with probability `slip_prob` = 0.02, `μ ~ U(lo(d), hi(d))` with `[lo, hi]` interpolated from (0.05, 0.35) at
+d = 0 to (0.03, 0.25) at d = 1, else `μ_nominal` = 0.8. A slip is thus a rare random event (about one per robot
+every 6 s) that lasts one stance; the next touchdown restores `μ_nominal` with probability 0.98. `μ_nominal` again
+on leaving the grid or on reset. With `resample_on_touchdown=False` the draw is once per entry (in practice once
+per foot and episode; the default before 2026-10-26, with `slip_prob` 0.75). Only the changed environments' foot shapes are written.
 
 **Sand** (sand patches). A foot is in the sand if it is over a soft patch footprint and `z_foot < s + r_foot`. Then
 `F_xy = -c_drag(d) v_xy`, `F_z = -c_suction(d) max(v_z, 0)` (c_drag 20–80, c_suction 30–150 N s/m), capped at 60 N,
@@ -306,7 +308,7 @@ time at 84 robots, bound by the per-step cost of the manager-based env (MJWarp w
 tile size changed nothing). The zone labels of the Harsh World cost about 1 ms per step; the terrain maps have no
 labels, and the event skips the physics a type does not need.
 
-**Tuned defaults** (spec → now): `slip_prob` 0.5 → 0.75 (slide ratio x2.6 < 3); `mesa_height` / `drop_height` /
+**Tuned defaults** (spec → then): `slip_prob` 0.5 → 0.75 (slide ratio x2.6 < 3; since 2026-10-26 0.02 per touchdown, §6); `mesa_height` / `drop_height` /
 `tread_width` (0.6, 2) / (0.3, 1) / (1, 2.5) → (3, 4) / (1.5, 2) / (4, 4) and `scree_prob` / `rubble_prob` 0.4 /
 0.2 → 0.2 / 0.1 (no flight in 60 s: the policy steps down drops of up to 1 m); `platform_width` 2 → 3 m (robots
 touched the stairs and slopes at the platform edge within 1 s); dynamic rocks 1500 in total → 4 per robot (16 cost
@@ -314,6 +316,9 @@ touched the stairs and slopes at the platform edge within 1 s); dynamic rocks 15
 
 ## 6. Changelog
 
+- 2026-10-26: Slip default: drawn at every touchdown (`resample_on_touchdown=True`), low with `slip_prob` 0.02
+  instead of 0.75 once per foot and episode; a slip lasts one stance. The T3 slide ratio (§5) was measured with the
+  old default and not rerun. Reason: the user's request (rare random slips, friction restored afterwards).
 - 2026-10-24: First version as the Harsh World (`velocity/a2_harsh_world`): 10 properties on one mixed map, zone
   map and labels, slip/sand/collapse/rock interactions, build and probe scripts. Reason: the Harsh World spec.
 - 2026-10-24: After the first GPU runs. Heightfield collision, box sand slabs, one static convex collider per rock,

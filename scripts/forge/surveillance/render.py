@@ -7,10 +7,11 @@
 
 The motion is replayed kinematically: every frame writes the logged base pose and joint positions and renders
 without stepping physics. The terrain is regenerated from the task and seed in ``meta.json`` and checked
-against the saved ``terrain.npz``. Videos land in ``<collection>/videos/<event>.mp4``::
+against the saved ``terrain.npz``. Videos land in ``<collection>/videos/<event>.mp4`` (with ``--triggers``: the
+event-trigger windows, ``<collection>/triggers/videos/``)::
 
-    euler enqueue fault_render -- python scripts/forge/fault_analysis/render.py \\
-        /workspace/isaaclab/logs/fault_analysis/<experiment>/<collection> --events 0 3 17
+    euler enqueue fault_render -- python scripts/forge/surveillance/render.py \\
+        /workspace/isaaclab/logs/surveillance/<experiment>/<collection> --events 0 3 17
 """
 
 # set before importing anything that defines Warp kernels (see play.py)
@@ -53,17 +54,21 @@ def main() -> None:
         "--pick", type=int, default=None, help="Without --events: N full-window failures evenly spread over sim time."
     )
     parser.add_argument("--eye", type=float, nargs=3, default=(-1.0, -1.0, 0.6), help="Camera offset [m].")
+    parser.add_argument("--triggers", action="store_true", help="The event-trigger windows (triggers/) instead.")
     render_args, argv = parser.parse_known_args(sys.argv[1:])
     collection = os.path.abspath(render_args.collection)
     with open(os.path.join(collection, "meta.json")) as f:
         meta = json.load(f)
+    # events, index.csv and videos of the failures, or of the trigger windows
+    root = os.path.join(collection, "triggers") if render_args.triggers else collection
     events = render_args.events
     if events is None:
-        with open(os.path.join(collection, "index.csv")) as f:
+        with open(os.path.join(root, "index.csv")) as f:
             rows = list(csv.DictReader(f))
         full = [r for r in rows if int(r["num_frames"]) == meta["num_frames"]]
         if render_args.pick is not None:
-            full = [r for r in full if r["terminal"] == "True"]
+            if not render_args.triggers:
+                full = [r for r in full if r["terminal"] == "True"]
             times = np.array([float(r["sim_time_s"]) for r in full])
             targets = np.linspace(times.min(), times.max(), render_args.pick) if len(full) else []
             rows = [full[i] for i in sorted({int(np.abs(times - t).argmin()) for t in targets})]
@@ -98,9 +103,9 @@ def main() -> None:
             zeros_root = torch.zeros(1, 6, device=env.device)
             zeros_joint = torch.zeros(1, robot.num_joints, device=env.device)
             eye = np.array(render_args.eye)
-            os.makedirs(os.path.join(collection, "videos"), exist_ok=True)
+            os.makedirs(os.path.join(root, "videos"), exist_ok=True)
             for event in events:
-                data = np.load(os.path.join(collection, "events", f"{event:06d}.npz"))
+                data = np.load(os.path.join(root, "events", f"{event:06d}.npz"))
                 pose = torch.as_tensor(np.concatenate([data["root_pos_w"], data["root_quat_w"]], -1), device=env.device)
                 joint_pos = torch.as_tensor(data["joint_pos"], device=env.device)
                 frames = []
@@ -116,7 +121,7 @@ def main() -> None:
                     frames.append(viz.render_rgb_array())
                     if args_cli.real_time:
                         time.sleep(meta["step_dt"])
-                path = os.path.join(collection, "videos", f"{event:06d}.mp4")
+                path = os.path.join(root, "videos", f"{event:06d}.mp4")
                 ImageSequenceClip(frames, fps=round(1.0 / meta["step_dt"])).write_videofile(path, logger=None)
                 print(
                     f"[fault] {path}: contact {data['contact_bodies']}, terminations {data['terminations']}", flush=True
