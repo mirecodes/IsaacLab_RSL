@@ -114,9 +114,23 @@ median of 4 steps, power loss in 10. False alarms come from terrain transients a
 a longer history (H = 10, 25) improves identification (top-1 0.87, 0.92) but not the latency at a matched
 false-alarm rate.
 
+**v2** (thresholds set on validation to 0.5 false alarms / min; history 5 policy steps; PD-rate inputs; 80 ms label
+grace + hard-negative fine-tuning): MLP · proprio finds 0.820 of the faults with the right joint within 500 ms
+(v1 at the same false-alarm rate: 0.742), median 155 ms; each change adds 1.6–2.8 pt. At the alarm the diagnosis is
+right for 0.992 (joint) / 0.995 (leg), so joint- and leg-level success coincide.
+
+**60 ms (3 policy steps)** (`scripts/forge/fault_detector/tmp/REPORT.md`): proprioception reaches at most 0.283
+(physics features, joint-shared network); half of the faults barely change the motion within 60 ms. With a
+per-joint torque (motor-current) reading, a joint-shared network finds 0.957 within 60 ms at 0.49 false alarms / min.
+
 Actuator-path check: with faults off, 512 robots fell 31 times in their first 20 s episode with this task's Isaac Lab
 DC motor vs 34 times with the training setup's Newton-native one (same seed, same per-level pattern).
 
 ## 6. Changelog
 
 - 2026-10-25: First version and results v1 (2 × 2 × 3 seeds, history ablation H = 10, 25). Reason: the user's spec.
+- 2026-10-25: v2: matched-false-alarm comparison, H = 5, PD-rate recording (`collect.py --pd_rate`, actuator probe),
+  label grace + hard-negative mining, confusion / leg reporting; `pd/applied_torque` recorded. Reason: the user's
+  feedback on v1.
+- 2026-10-25: 60 ms exploration (`scripts/forge/fault_detector/tmp/`). Reason: the user's request to reach detection
+  within 3 policy steps, or explain why not.

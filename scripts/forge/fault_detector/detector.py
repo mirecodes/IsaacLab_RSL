@@ -171,15 +171,21 @@ def load_episodes(dataset_dir: str, inputs: list[str], episode_ids=None, rate: s
     meta = read_meta(dataset_dir)
     m = int(meta.get("decimation", 4)) if rate == "pd" else 1
     index = {int(r["episode_id"]): r for r in read_index(dataset_dir)}
-    keep = None if episode_ids is None else set(int(i) for i in episode_ids)
-    parts: dict[str, list] = {k: [] for k in ("x", "contact", "command", "ep_len", "ids")}
-    noise, names = None, None
-    for path in sorted(glob.glob(os.path.join(dataset_dir, "shards", "*.npz"))):
+    keep = None if episode_ids is None else list(set(int(i) for i in episode_ids))
+    parts: dict[str, list] = {k: [] for k in ("contact", "command", "ep_len", "ids")}
+    noise, names, x, filled = None, None, None, 0
+    paths = sorted(glob.glob(os.path.join(dataset_dir, "shards", "*.npz")))
+    # the inputs are filled into one preallocated array: no second copy of the largest array while loading
+    selected = {}
+    for path in paths:
+        with np.load(path) as shard:
+            ep_len, ep_ids = shard["ep_len"], shard["episode_id"]
+        sel = np.ones(len(ep_ids), bool) if keep is None else np.isin(ep_ids, keep)
+        if sel.any():
+            selected[path] = (ep_len, ep_ids, sel)
+    total = sum(int(ep_len[sel].sum()) * m for ep_len, _, sel in selected.values())
+    for path, (ep_len, ep_ids, sel) in selected.items():
         shard = np.load(path)
-        ep_len, ep_ids = shard["ep_len"], shard["episode_id"]
-        sel = np.ones(len(ep_ids), bool) if keep is None else np.isin(ep_ids, list(keep))
-        if not sel.any():
-            continue
         rows = np.repeat(sel, ep_len)
         columns, noise, names = [], [], []
         for name in inputs:
@@ -198,7 +204,11 @@ def load_episodes(dataset_dir: str, inputs: list[str], episode_ids=None, rate: s
             columns.append(value.astype(np.float16 if m > 1 else np.float32))
             noise += [scale] * value.shape[1]
             names += [f"{name}[{i}]" for i in range(value.shape[1])]
-        parts["x"].append(np.concatenate(columns, axis=1))
+        if x is None:
+            x = np.empty((total, sum(c.shape[1] for c in columns)), dtype=columns[0].dtype)
+        np.concatenate(columns, axis=1, out=x[filled : filled + len(columns[0])])
+        filled += len(columns[0])
+        del columns
         parts["contact"].append(np.repeat(shard["analysis/foot_contact"][rows] > 0.5, m, axis=0))
         parts["command"].append(np.repeat(shard["detector/velocity_command"][rows], m, axis=0))
         parts["ep_len"].append(ep_len[sel] * m)
@@ -219,7 +229,7 @@ def load_episodes(dataset_dir: str, inputs: list[str], episode_ids=None, rate: s
     mask[np.flatnonzero(faulty), joint[faulty]] = True
     ftype = np.where(faulty, np.repeat(np.array([int(e["fault_type"]) for e in episodes]), ep_len), 0).astype(np.int8)
     return Episodes(
-        x=np.concatenate(parts["x"]),
+        x=x,
         mask=mask,
         ftype=ftype,
         since=since,
@@ -359,9 +369,16 @@ def num_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+def chunked(model: Detector, x: torch.Tensor, batch: int = 32768):
+    """``model(x)`` in batches (a GRU's workspace for a whole validation set exceeds the GPU)."""
+    outs = [model(part) for part in x.split(batch)]
+    types = [t for _, t in outs]
+    return torch.cat([j for j, _ in outs]), (torch.cat(types) if types[0] is not None else None)
+
+
 def loss_fn(model: Detector, cfg: DetectorCfg, x, mask, ftype, since, grace: int = 0) -> torch.Tensor:
     """BCE over joints + lambda_type CE over the type; samples ``0 <= since < grace`` are left out (label grace)."""
-    joint_logits, type_logits = model(x)
+    joint_logits, type_logits = model(x) if model.training else chunked(model, x)
     pos_weight = torch.full((mask.shape[1],), cfg.pos_weight, device=x.device)
     bce = nn.functional.binary_cross_entropy_with_logits(joint_logits, mask, pos_weight=pos_weight, reduction="none")
     keep = ((since < 0) | (since >= grace)).float()
@@ -373,7 +390,7 @@ def loss_fn(model: Detector, cfg: DetectorCfg, x, mask, ftype, since, grace: int
 
 
 @torch.no_grad()
-def predict(model: Detector, src: WindowSource, noise: bool, seed: int = 0, batch: int = 65536, rows=None):
+def predict(model: Detector, src: WindowSource, noise: bool, seed: int = 0, batch: int = 32768, rows=None):
     """Joint probabilities [S, J] and type probabilities [S, 3] at every row of ``src`` (or the given rows)."""
     model.eval()
     g = torch.Generator(device=src.device).manual_seed(seed)
@@ -440,7 +457,7 @@ def train(cfg: DetectorCfg, train_data: Episodes, val_data: Episodes, device: st
             with torch.no_grad():
                 y = (val.mask[val_rows], val.ftype[val_rows], val.since[val_rows])
                 val_loss = loss_fn(model, cfg, val_x, *y, grace).item()
-                f1 = macro_f1(torch.sigmoid(model(val_x)[0]), val.mask[val_rows])
+                f1 = macro_f1(torch.sigmoid(chunked(model, val_x)[0]), val.mask[val_rows])
             history.append({"phase": name, "epoch": epoch, "train_loss": total / iters, "val_loss": val_loss,
                             "val_macro_f1": f1, "wall_s": round(time.time() - start, 1)})  # fmt: skip
             log(f"[train] {name} epoch {epoch}: loss {total / iters:.4f}, val loss {val_loss:.4f}, val F1 {f1:.4f}")
@@ -469,7 +486,7 @@ def train(cfg: DetectorCfg, train_data: Episodes, val_data: Episodes, device: st
         run_phase("hnm", cfg.hnm_epochs, cfg.lr * 0.1, sampling_cdf(src, cfg, 1.0 + cfg.hnm_weight * p_any), False)
     model.eval()
     with torch.no_grad():
-        final_f1 = macro_f1(torch.sigmoid(model(val_x)[0]), val.mask[val_rows])
+        final_f1 = macro_f1(torch.sigmoid(chunked(model, val_x)[0]), val.mask[val_rows])
     return {
         "model": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
         "cfg": dataclasses.asdict(cfg),

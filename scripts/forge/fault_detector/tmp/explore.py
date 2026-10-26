@@ -324,7 +324,8 @@ def choose_rules(val, z, legs, skip, device) -> tuple[dict, dict]:
     for rule in candidate_rules(val, z, skip):
         stat = stats[rule["rule"]] = statistic(val, z, rule, skip, device)
         thr = threshold(val, stat, rule["k"], skip, TARGET)
-        results.append({**rule, "thr": thr, **score_rows(val, stat, thr, rule["k"], legs, skip)[0]})
+        # the rule last: closed_loop's summary has its own k (1, the alarm is already held)
+        results.append({**score_rows(val, stat, thr, rule["k"], legs, skip)[0], **rule, "thr": thr})
     best = {obj: max(results, key=lambda r: r[f"success_{obj}_60ms"]) for obj in ("joint", "leg")}
     trade = []
     stat, k = stats[best["joint"]["rule"]], best["joint"]["k"]
@@ -594,6 +595,7 @@ def cmd_selftest(_args) -> None:
             with open(os.path.join(out, f"{name}_s0", "val.json")) as f:
                 v = json.load(f)
             assert v["best"]["joint"]["fa_per_min"] <= TARGET + 1e-9, (name, v["best"]["joint"])
+            assert all(r["k"] == int(r["rule"].split("_")[1]) for r in v["rules"] if r["drift"] is None), name
         test_root = os.path.join(root, "test_id")
         td.make_dataset(test_root, num_episodes=60, seed=1)
         args.specs, args.test = ["J=joint/current"], True
