@@ -8,6 +8,11 @@ These scripts play a trained RSL-RL locomotion policy on many robots in parallel
 | [analyze.py](analyze.py) | Offline, numpy only. It flags which fault rules (A–E) each saved window hits, and when. |
 | [render.py](render.py) | Replays saved events on the regenerated terrain and writes one robot-tracking mp4 per event. |
 | [campaign.py](campaign.py) | Standard library only. Queues one collect + render job per (policy, terrain map) on Euler, and tabulates their `summary.json` files. |
+| [taxonomy.py](taxonomy.py) | Offline (numpy, scikit-learn, matplotlib). Per-frame signal labels (rules A–E + privileged state), failure mode per fall, window features, Ward clustering, separability of the known causes. |
+| [classify.py](classify.py) | Offline (torch, scikit-learn). Which event acts on the robot from proprioception only, labels from the triggers (class probability vs time since the trigger, onset AUROC); `--falls_csv`: failure mode of the falls from proprioception. |
+| [sequences.py](sequences.py) | Offline (torch, scikit-learn, tslearn). Taxonomy methods compared on the same falls: rules, first violated constraint, label shares + Ward (with / without the cause flags), DTW cost metrics (state, event labels, student latent), autoencoder latent, privileged-state student latent; scored by stability, NMI with terrain / policy, physical coherence, detectability beyond the context. Writes `falls.csv` with every method's label. |
+| [detect.py](detect.py) | Offline (torch, scikit-learn). Early-detection strategies (supervised hazard, with IMU, with harmless events as negatives, per-mode hazard, forward-model anomaly, tilt, critic value) at a fixed false-alarm rate on normal walking: lead time before the balance loss per failure mode, alarms on harmless events, per-mode signatures. |
+| [counterfactual.py](counterfactual.py) | Isaac Lab, GPU. Restores the logged state before each recorded fall (Robust: root, joints, CPG phase) and replays the policy with the logged or a zero command: which reaction avoids the fall; control restores from windows without a fall. |
 | [test_analyze.py](test_analyze.py), [test_campaign.py](test_campaign.py) | Checks of the geometry helpers of `analyze.py` and of the summary of `campaign.py`. |
 
 ## Usage
@@ -89,6 +94,38 @@ uv run --no-project --with numpy python scripts/forge/surveillance/analyze.py \
 
 Record the results in `forge/surveillance/REPORT.md` §5 (a new §5.2, set up as §5.1) and in **Collections** below.
 
+### Campaign `v3` (Hard tasks, 2026-10-31; smoke and `v3_hard` done, `forge/surveillance/REPORT.md` §3.5, §5.4)
+
+The `-Hard` tasks (`forge/surveillance/REPORT.md` §3.5: hardest rows, ice patches, soft deep sand, crusts that drop
+to the hardpan, taller stubs) and the new `mixed_field` (§3.6). Collections now also log the terrain event's
+per-foot flags and the stone poses (fields below), and `render.py` replays the stones. Checked only on the Mac CPU
+container (all Hard tasks build and step, the fields have the right shapes, a stone replay renders); the physics is
+unverified until the smoke test.
+
+```bash
+# 1. smoke: Robust, the event terrains, 1 min sim each
+python scripts/forge/surveillance/campaign.py enqueue --name smoke_hard --hard --policies Robust \
+    --terrains slip_field slip_slope sand_field crust_collapse mixed_field gravel_field --minutes 1 --triggers 10 --videos 2
+euler fetch surveillance/smoke_hard
+```
+
+Check: `summary.json` falls per minute (v2: ~0.01 / min per terrain); in the trigger windows the new
+`terrain_on_ice`, `terrain_in_sand`, `terrain_collapse` flags fire; feet sink 12–25 cm in sand (v2: 2.6 cm); the
+gravel videos show the stones. If a terrain fails every robot within seconds, lower that knob in `apply_hard`.
+
+```bash
+# 2. full: 2 policies x 11 terrains, 10 min or 100 falls each
+python scripts/forge/surveillance/campaign.py enqueue --name v3_hard --hard
+euler fetch surveillance/v3_hard
+# 3. taxonomy and classifiers on it (event labels now come from the logged flags)
+uv run --no-project --with numpy --with scikit-learn --with matplotlib python scripts/forge/surveillance/taxonomy.py \
+    --out results/taxonomy_v3 --falls results/euler/isaaclab3/surveillance/v3_hard/*/* \
+    --baseline results/euler/isaaclab3/surveillance/v2/*/{rough_field,pit_field,stub_field,rough_slope,rough_stairs}
+uv run --no-project --with torch --with numpy --with scikit-learn --with matplotlib python \
+    scripts/forge/surveillance/classify.py results/euler/isaaclab3/surveillance/v3_hard/Robust/mixed_field \
+    --out results/classify_v3/Robust_mixed
+```
+
 ### Single collections
 
 On Euler (the container's cwd is the repo root, and `logs/` is the profile's log directory):
@@ -124,6 +161,7 @@ python scripts/forge/surveillance/render.py \
 | `--terminations` | `base_contact` | Failure terms kept; the task's others (e.g. `bad_orientation`) are removed. Time-outs stay. |
 | `--contact_onsets` | off | Also record the onset of a non-foot contact as an event (the robot keeps walking). |
 | `--max_triggers` | 0 | Also save up to this many event-trigger windows into `triggers/` (tasks with `event_trigger`); paced over `--max_steps`. |
+| `--trigger_quiet_s` | 1.0 | A rising edge of the trigger counts only after it was off this long (an onset, not a robot re-entering the patch it is crossing). |
 | `--foot_bodies` | `.*_foot` | Regex for the foot bodies. With `--contact_onsets`, contact on any other body is an event. |
 | `--contact_threshold` | 1.0 | Trigger force [N], the same as the stock `base_contact` termination. |
 | `--grace_s` | 1.0 | Contact onsets this soon after a (re)spawn are ignored: the reset pose often puts a calf on the ground. |
@@ -246,6 +284,8 @@ Frame `t` is sampled at the end of env step `t`, before any reset. It holds the 
 | `action_<term>_phase` | e.g. 4 | CPG phase of action terms that have one (robust teacher) |
 | `obs_<group>` | per group | every observation group, as the policy sees it |
 | `value` | – | critic $V(o_t)$ (PPO runners only) |
+| `terrain_foot_mu`, `terrain_low_mu`, `terrain_on_ice`, `terrain_in_sand`, `terrain_collapse` | F each | terrain maps, since 2026-10-31: the terrain event's per-foot state (applied friction, slip or ice sample active, on an ice cell, in soft sand, its crust collapsed this step); privileged |
+| `rock_pose_w` | K×7 | `gravel_field`, since 2026-10-31: pose of the robot's stones, replayed by `render.py` |
 
 ## Rule flags
 
@@ -326,6 +366,17 @@ Choices the request left open, and how they were made here:
 
 ## Changelog
 
+- 2026-11-01: `sequences.py`, `detect.py`, `counterfactual.py`, `test_sequences.py`; `classify.py --stride`.
+  Reason: the user's request (methods to categorize the failure sequences and to detect each category; write-up in
+  `results/methods_2026-11-01/REPORT.md`).
+- 2026-10-31 (evening): `collect.py --trigger_quiet_s` (default 1 s; trigger windows start only at onsets);
+  `classify.py` labels frames from the logged flags (`frame_labels`); `taxonomy.py` `sink_5cm` only straight down.
+  Reason: in `v3_hard` the frames before a slip / sand trigger had the event in 21–77 % of the frames
+  (`forge/surveillance/REPORT.md` §5.4), and sliding feet on slopes counted as sinking.
+- 2026-10-31: `collect.py` logs the terrain event's per-foot flags and the stone poses; `render.py` replays the
+  stones; `campaign.py --hard`; `taxonomy.py`, `classify.py`; `analyze.load_collection` reads a `triggers/` dir with
+  its parent's `meta.json`. Reason: the 2026-10-26 meeting (stones missing in the videos, privileged labels for the
+  taxonomy, self-supervised failure classes).
 - 2026-10-26: `slip_field` (10 terrain types; `campaign.py` reads `EXTRA_TERRAINS` of `forge/surveillance`). Reason: the user's request.
 - 2026-10-26: Event-trigger windows (`--max_triggers`, `triggers/`, `render.py --triggers`); campaign defaults 20 robots, 10 min, 100 falls, 100 trigger windows, 10 + 10 videos. Reason: the user's request (check that the terrain events fire, apart from the falls).
 - 2026-10-26: Moved to `scripts/forge/surveillance` with the task (`forge/surveillance`, `IsaacContrib-Surveillance-*`); collections now under `logs/surveillance/`; campaign defaults 100 falls, 10 robots. The campaign `terrain_v1` (20 robots, 200 falls) stays under `logs/fault_analysis/terrain_v1`. Reason: the user's request.

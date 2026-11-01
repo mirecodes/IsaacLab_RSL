@@ -135,7 +135,15 @@ class terrain_step(ManagerTermBase):
         self.foot_mu = torch.full((n, f), nominal, device=dev)
         self.foot_friction = self.foot_mu.clone()
         self.low_mu = torch.zeros(n, f, dtype=torch.bool, device=dev)
+        self.on_ice = torch.zeros(n, f, dtype=torch.bool, device=dev)
         self._in_slip = torch.zeros(n, f, dtype=torch.bool, device=dev)
+        # ice cells over the tile grid: friction per cell, inf where there is no ice
+        cells = torch.ceil(self.map.size * torch.tensor([self.map.num_rows, self.map.num_cols]).to(self.map.size)
+                           / world.slip.ice_cell).long().tolist()  # fmt: skip
+        rng = torch.Generator().manual_seed(world.seed)
+        icy = torch.rand(cells, generator=rng) < world.slip.ice_frac
+        mu_ice = world.slip.ice_mu[0] + torch.rand(cells, generator=rng) * (world.slip.ice_mu[1] - world.slip.ice_mu[0])
+        self._ice_mu = torch.where(icy, mu_ice, float("inf")).to(dev)
         self.in_sand = torch.zeros(n, f, dtype=torch.bool, device=dev)
         self.collapse_event = torch.zeros(n, f, dtype=torch.bool, device=dev)
         # crust / collapsed flags per patch, plus a trailing "no patch" entry so that patch id -1 indexes safely
@@ -169,6 +177,7 @@ class terrain_step(ManagerTermBase):
         self.foot_mu[env_ids] = self.world.slip.mu_nominal
         self.foot_friction[env_ids] = self.world.slip.mu_nominal
         self.low_mu[env_ids] = False
+        self.on_ice[env_ids] = False
         self._in_slip[env_ids] = False
         self.in_sand[env_ids] = False
         self.collapse_event[env_ids] = False
@@ -181,8 +190,9 @@ class terrain_step(ManagerTermBase):
 
     def __call__(self, env: ManagerBasedEnv, env_ids, world, asset_cfg, sensor_cfg) -> None:
         pos = self.robot.data.body_link_pos_w.torch[:, self.foot_ids]
-        if self.map.zone == SLIP:
-            self._slip(env, *self.map.lookup(pos[..., :2]))
+        # slip terrain, or ice patches on any terrain (where the slab of a sand patch, with priority, keeps its own mu)
+        if self.map.zone == SLIP or self.world.slip.ice_frac > 0:
+            self._slip(env, *self.map.lookup(pos[..., :2]), self._ice(pos[..., :2]))
         if self.map.patches:
             patch, surface = self.map.patch(pos[..., :2])
             self._collapse(env, patch, self.contact.data.net_forces_w.torch[:, self.contact_foot_ids, 2].abs())
@@ -196,8 +206,18 @@ class terrain_step(ManagerTermBase):
 
     # -- slip
 
-    def _slip(self, env: ManagerBasedEnv, in_slip: torch.Tensor, difficulty: torch.Tensor) -> None:
-        """``in_slip``: foot on the slip terrain (the tile grid), ``difficulty``: its tile's difficulty (N, F)."""
+    def _ice(self, xy: torch.Tensor) -> torch.Tensor:
+        """Friction of the ice cell under each point, inf where there is no ice (off the grid included)."""
+        ij = torch.floor((xy - self.map.corner) / self.world.slip.ice_cell).long()
+        h, w = self._ice_mu.shape
+        inside = (ij[..., 0] >= 0) & (ij[..., 0] < h) & (ij[..., 1] >= 0) & (ij[..., 1] < w)
+        mu = self._ice_mu[ij[..., 0].clamp(0, h - 1), ij[..., 1].clamp(0, w - 1)]
+        return torch.where(inside, mu, float("inf"))
+
+    def _slip(self, env: ManagerBasedEnv, in_slip: torch.Tensor, difficulty: torch.Tensor, ice: torch.Tensor) -> None:
+        """``in_slip``: foot on the slip terrain (the tile grid), ``difficulty``: its tile's difficulty, ``ice``: the
+        friction of the ice cell under it, inf if none (N, F). A touchdown on ice takes the ice friction, otherwise
+        the random slip draw."""
         cfg = self.world.slip
         enter = in_slip & ~self._in_slip
         if cfg.resample_on_touchdown:
@@ -211,10 +231,14 @@ class terrain_step(ManagerTermBase):
         hi = interp((cfg.mu_slip_easy[1], cfg.mu_slip_hard[1]), difficulty)
         sample = lo + torch.rand_like(lo) * (hi - lo)
         low = torch.rand_like(lo) < cfg.slip_prob
-        self.foot_mu = torch.where(enter, torch.where(low, sample, cfg.mu_nominal), self.foot_mu)
-        self.low_mu = torch.where(enter, low, self.low_mu)
+        icy = torch.isfinite(ice)
+        mu = torch.where(icy, ice, torch.where(low, sample, cfg.mu_nominal))
+        self.foot_mu = torch.where(enter, mu, self.foot_mu)
+        self.low_mu = torch.where(enter, low | icy, self.low_mu)
+        self.on_ice = torch.where(enter, icy, self.on_ice)
         self.foot_mu[leave] = cfg.mu_nominal
         self.low_mu[leave] = False
+        self.on_ice[leave] = False
         if cfg.observe_slip:
             self.foot_friction[:] = self.foot_mu
         self._write_foot_mu((enter | leave).any(dim=1).nonzero().squeeze(-1))

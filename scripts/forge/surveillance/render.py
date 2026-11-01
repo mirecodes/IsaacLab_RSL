@@ -99,6 +99,8 @@ def main() -> None:
 
             viz = next(v for v in env.sim.visualizers if v.cfg.backend.visualizer_type in CAPTURE_VISUALIZER_TYPES)
             robot = env.scene["robot"]
+            # gravel_field: the robot's stones, replayed from their logged poses (collections since 2026-10-31)
+            rocks = env.scene.rigid_object_collections.get("rocks")
             env_ids = torch.tensor([0], device=env.device)
             zeros_root = torch.zeros(1, 6, device=env.device)
             zeros_joint = torch.zeros(1, robot.num_joints, device=env.device)
@@ -108,8 +110,18 @@ def main() -> None:
                 data = np.load(os.path.join(root, "events", f"{event:06d}.npz"))
                 pose = torch.as_tensor(np.concatenate([data["root_pos_w"], data["root_quat_w"]], -1), device=env.device)
                 joint_pos = torch.as_tensor(data["joint_pos"], device=env.device)
+                rock_pose = None
+                if rocks is not None and "rock_pose_w" in data:
+                    rock_pose = torch.as_tensor(data["rock_pose_w"], device=env.device)  # [T, K, 7]
+                    rock_ids, rock_vel = list(range(rock_pose.shape[1])), torch.zeros(1, rock_pose.shape[1], 6,
+                                                                                      device=env.device)  # fmt: skip
                 frames = []
                 for t in range(len(pose)):
+                    if rock_pose is not None:
+                        rocks.write_body_link_pose_to_sim_index(body_poses=rock_pose[t : t + 1], body_ids=rock_ids,
+                                                                env_ids=env_ids)  # fmt: skip
+                        rocks.write_body_com_velocity_to_sim_index(body_velocities=rock_vel, body_ids=rock_ids,
+                                                                   env_ids=env_ids)  # fmt: skip
                     robot.write_root_pose_to_sim_index(root_pose=pose[t : t + 1], env_ids=env_ids)
                     robot.write_root_velocity_to_sim_index(root_velocity=zeros_root, env_ids=env_ids)
                     robot.write_joint_position_to_sim_index(position=joint_pos[t : t + 1], env_ids=env_ids)

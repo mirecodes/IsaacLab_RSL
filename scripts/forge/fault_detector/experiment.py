@@ -666,6 +666,85 @@ def cmd_compare(args) -> None:
     fig.savefig(os.path.join(args.out_dir, "success_compare.png"), dpi=130)
 
 
+DEBOUNCE_MS = (0, 20, 40, 60)
+"""Debounce candidates of ``fd.calibrate`` [ms]: k = 1, 4, 8, 12 samples at the PD rate."""
+
+
+def cmd_debounce(args) -> None:
+    """Every run's (tau, k) trade-off: for each debounce k alone, tau set on validation to each false-alarm target,
+    scored on ``test_id`` (noise on). Writes ``<exp>/debounce/debounce.{json,md,png}``."""
+    exp, device = args.exp_dir, "cuda" if torch.cuda.is_available() else "cpu"
+    runs = [(a, o, s) for (a, o), seeds in load_runs(exp).items() for s in sorted(seeds)]
+    load = lambda a, o, s: torch.load(os.path.join(exp, f"{a}_{o}_s{s}", "checkpoint.pt"), map_location="cpu",  # noqa: E731
+                                      weights_only=False)  # fmt: skip
+    _, base = fd.load_detector(load(*runs[0]), "cpu")
+    with open(os.path.join(exp, "split.json")) as f:
+        val_ids = json.load(f)["val"]
+    test_dir = next(d for d in base.test_dirs if set_name(d) == "test_id")
+    test_ids = [r["episode_id"] for r in fd.within_health(fd.read_index(test_dir), base.max_health)]
+    current = ["motor_current"] if any(o == "proprio_current" for _, o, _ in runs) else []
+    inputs = fd.PROPRIO + list(base.extra_terms) + current
+    val_all = fd.load_episodes(base.dataset_dir, inputs, val_ids, base.rate)
+    test_all = fd.load_episodes(test_dir, inputs, test_ids, base.rate)
+    legs = joint_legs(fd.read_meta(base.dataset_dir)["joint_names"])
+    results: dict = {}
+    for arch, obs_set, seed in runs:
+        state = load(arch, obs_set, seed)
+        model, cfg = fd.load_detector(state, device)
+        cols = [val_all.names.index(n) for n in state["input_names"]]
+        val, test = subset(val_all, cols), subset(test_all, cols)
+        skip = round(cfg.skip_initial_s / val.sample_dt)
+        p_val, p_test = (fd.predict(model, fd.WindowSource(d, cfg, device, state["mean"], state["std"]), True, 1)[0]
+                         for d in (val, test))  # fmt: skip
+        for ms in DEBOUNCE_MS:
+            for target in FA_TARGETS:
+                c = fd.calibrate(val, p_val.max(axis=1), skip, target, debounce_ms=(ms,))
+                s = fd.closed_loop(test, p_test, legs, skip, c["tau"], c["k"])[0]
+                cell = results.setdefault(f"{arch},{obs_set}", {}).setdefault(str(ms), {})
+                cell.setdefault(str(target), []).append({"seed": seed, "tau": c["tau"], "k": c["k"]} | {
+                    key: s[key] for key in ("fa_per_min", "success_joint_500ms", "median_latency_ms")})  # fmt: skip
+        print(f"[debounce] {exp} {arch}_{obs_set}_s{seed} done", flush=True)
+    out = os.path.join(exp, "debounce")
+    os.makedirs(out, exist_ok=True)
+    fd.save_json(os.path.join(out, "debounce.json"), results)
+    mean = lambda xs, key: float(np.nanmean([num(x[key]) for x in xs]))  # noqa: E731
+    label = lambda ms: f"k = {max(1, ms // 5)} ({ms} ms)"  # noqa: E731
+    lines = [f"# Debounce comparison ({exp})", "",
+             "For each debounce k alone, tau set on validation to the false-alarm target; test_id, noise on, mean over "
+             f"seeds. Cells at {MAIN_TARGET} / min: tau / success joint ≤ 500 ms / median latency ms / FA per min.", "",
+             "| Config | " + " | ".join(label(ms) for ms in DEBOUNCE_MS) + " |",
+             "|---|" + "---|" * len(DEBOUNCE_MS)]  # fmt: skip
+    for config, by_k in results.items():
+        cells = []
+        for ms in DEBOUNCE_MS:
+            xs = by_k[str(ms)][str(MAIN_TARGET)]
+            cells.append(f"{mean(xs, 'tau'):.3f} / {mean(xs, 'success_joint_500ms'):.3f} / "
+                         f"{mean(xs, 'median_latency_ms'):.0f} / {mean(xs, 'fa_per_min'):.2f}")  # fmt: skip
+        lines.append(f"| {config.replace(',', ' · ')} | " + " | ".join(cells) + " |")
+    with open(os.path.join(out, "debounce.md"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    plt = _pyplot()
+    if plt is None:
+        return
+    fig, axes = plt.subplots(3, len(results), figsize=(4.2 * len(results), 10), squeeze=False, sharey="row")
+    for col, (config, by_k) in enumerate(results.items()):
+        for ms in DEBOUNCE_MS:
+            pts = [by_k[str(ms)][str(t)] for t in FA_TARGETS]
+            fa = [mean(xs, "fa_per_min") for xs in pts]
+            for row, key in enumerate(("success_joint_500ms", "median_latency_ms", "tau")):
+                axes[row, col].plot(fa, [mean(xs, key) for xs in pts], "o-", label=label(ms))
+        axes[0, col].set_title(config.replace(",", " · "))
+        for row, ylabel in enumerate(("success: right joint within 500 ms", "median latency [ms]", "threshold tau")):
+            axes[row, col].set_xscale("log")
+            axes[row, col].grid(alpha=0.3)
+            axes[row, 0].set_ylabel(ylabel)
+        axes[-1, col].set_xlabel("false alarms per minute on test_id")
+    axes[0, 0].legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out, "debounce.png"), dpi=130)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -690,6 +769,9 @@ def main() -> None:
     p.add_argument("--focus", default="mlp,proprio", help="arch,obs_set drawn in the comparison figures")
     p.add_argument("--dataset_dir", default="logs/fault_detector/data/main", help="For joint names.")
     p.set_defaults(func=cmd_compare)
+    p = sub.add_parser("debounce", help="Each run's trade-off per debounce k (tau set per k), on test_id.")
+    p.add_argument("exp_dir")
+    p.set_defaults(func=cmd_debounce)
     args = parser.parse_args()
     args.func(args)
 

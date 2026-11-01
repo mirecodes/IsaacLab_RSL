@@ -78,6 +78,14 @@ class SlipCfg:
     """Re-draw at every touchdown; False draws once per entry (in practice once per foot and episode)."""
     observe_slip: bool = False
     """Whether the policy's privileged friction input reports the applied friction (True) or the nominal one."""
+    ice_frac: float = 0.0
+    """Share of the ``ice_cell`` squares of the map that are icy patches: a touchdown on one gets that cell's
+    friction ``U(ice_mu)``, so every foot that steps on the patch slips, not one at random. 0: no ice. Above 0 the
+    slip physics also runs off ``slip`` terrain (with its ``slip_prob`` draws too)."""
+    ice_cell: float = 2.0
+    """Side [m] of the ice cells, a square grid from the map corner."""
+    ice_mu: tuple[float, float] = (0.05, 0.15)
+    """Friction of an ice cell, uniform per cell."""
     ground_mu: float = 0.02
     """Friction of the terrain itself. MuJoCo-Warp uses ``max(mu_foot, mu_ground)``, so it must stay below the
     slip range for the foot value to decide the contact friction."""

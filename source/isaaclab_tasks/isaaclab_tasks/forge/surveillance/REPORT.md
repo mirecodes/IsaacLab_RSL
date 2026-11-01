@@ -1,6 +1,6 @@
 # Surveillance: A2 deployment on terrain maps
 
-**Gym IDs:** `IsaacContrib-Surveillance-<Type>-{Robust,Energy}`, `<Type>` as in `forge/terrain` plus `slip_field` (20 tasks)
+**Gym IDs:** `IsaacContrib-Surveillance-<Type>-{Robust,Energy}[-Hard]`, `<Type>` as in `forge/terrain` plus `slip_field`, `mixed_field` (44 tasks)
 **Base:** `A2RobustTerrainEnvCfg`, `A2EnergyTerrainEnvCfg` (`forge/terrain`), with the trained tasks' runner cfgs ·
 **Copied from:** `isaaclab.envs.mdp.reset_root_state_uniform` (`mdp/events.py`) · **Sources:** the user's request of 2026-10-25
 
@@ -68,6 +68,7 @@ terrain event term, which is one policy step old when the recorder reads it. `sc
 | `sand_field` | `sand_sink` | `in_sand`: a foot below the surface of a soft patch (ordinary sand or collapsed crust) |
 | `gravel_field` | `stone_step` | a foot with vertical force > 1 N, within half the length of one of its robot's stones (horizontally) and > 2 cm above the ground height map plus the foot radius |
 | `slip_slope`, `slip_field` | `foot_slip` | `low_mu` and vertical force > 1 N on the same foot: it touched down with a low friction (§3.4). The trigger moment is the slippery touchdown, whether or not the foot then slides |
+| `mixed_field` | `any_event` | any of `crust_collapse`, `sand_sink`, `foot_slip` (§3.6); which one is read from the logged terrain flags |
 | the others | `random_walk` | at random, $p = \Delta t / 5$ s per step and robot: normal walking, no event |
 
 ### 3.4 Slips, `slip_field`
@@ -84,6 +85,49 @@ the larger of the two. The policy's privileged friction input still reports 0.8 
 registered through `EXTRA_TERRAINS`). It is rough_field's ground with the slip event, at the same difficulties (0.4,
 0.55, 0.7). Tile layouts are seeded by the terrain name, so its tiles differ from `rough_field`'s. It is not an
 incline: steering with turns, as on the other flat types.
+
+### 3.5 `-Hard` variants
+
+v2 (§5.2) gave 25 falls in 66.7 robot-h, and the events barely act on the robot: feet sank at most 2.6 cm (median,
+Robust) into 8–16 cm deep sand, a collapsed crust (`soften`: ke 3e4 → 3e3 N/m, the stiffest sand) 2.3 cm, and from
+proprioception alone only the crust collapse is detectable (§5.3). The `-Hard` tasks (`make_env_cfg(..., hard=True)`,
+`apply_hard` in `env_cfg.py`) change, on top of the plain tasks:
+
+| Knob | Plain | Hard | Why |
+| --- | --- | --- | --- |
+| Rows kept | first 3 of 5 (d 0.4 / 0.55 / 0.7) | last 3 (d 0.7 / 0.85 / 1.0; inclines 22.5 / 33.75 / 45°) | stairs, pits, slopes never felled Robust at ≤ 0.7 |
+| Ice patches (slip terrains) | none | `ice_frac` 0.15 of 2 m cells, μ 0.05–0.15 | a single random slipping foot is absorbed |
+| Sand stiffness, depth | 800–3000 N/m, 8–20 cm | 60–240 N/m, 12–25 cm | sink to the hardpan within one stance: a hidden hole under a flat-looking surface |
+| Sand suction, force cap | 30–150 N s/m, 60 N | 150–400 N s/m, 120 N | a foot held on lift-off (stuck foot) |
+| Crust collapse | `soften`, 1.5–3 × 98 N | `disable` (to the hardpan), 0.8–1.5 × 98 N | support lost under one stance foot |
+| Stub / root height | 2–6 / 2–4 cm | 4–12 / 3–8 cm | up to a swing height; still narrower than the 0.1 m scanner grid |
+
+The first values came from the v2 measurements and the T2 / T6 probes of `forge/terrain` (800 N/m reached the
+hardpan under a 98 N static load; `disable` drops the foot to the hardpan). The GPU smoke runs (Robust, 1 min of
+20 robots per terrain, 10 trigger windows; `smoke_hard`, `smoke_hard2`, 2026-10-31) then measured:
+
+| Terrain | Falls / robot-min (v2 ≈ 0) | Event in the trigger windows |
+| --- | --- | --- |
+| slip_field | 0.65 (13 of 52 episodes) | a foot on ice in 75 % of the frames, applied μ median 0.23 |
+| slip_slope | 0.60 | a foot on ice in 39–80 % of the frames |
+| sand_field, 200–800 N/m | 0 | max sinkage below the surface median 6.0 cm (v2, same measure: 3.1 cm) |
+| sand_field, 60–240 N/m | 0 | median 13.6 cm, p90 17.4 cm |
+| crust_collapse | 0 | collapse flag at the trigger frame in 10 / 10; the foot drops 19.6 cm (median) |
+| mixed_field, 200–800 N/m | 0.05 | 10 windows: ice in 7, sand in 7, a crust collapse in 2 |
+| mixed_field, 60–240 N/m | 0.05 | sinkage median 12.2 cm; a foot on ice in 49 % of the frames |
+| gravel_field | 0 | stone poses logged, the stones render in the replay |
+
+Sinkage within one stance grows about as 1 / sqrt(stiffness) (it is limited by the stance time, not by the static
+equilibrium), so the sand stiffness was lowered from 200–800 to 60–240 N/m for ~11 cm; the Hard tasks use it.
+Robust falls only on the ice; it walks through deep sand and collapsing crusts.
+
+### 3.6 `mixed_field`
+
+In v2 every event lives on its own map, so a classifier can name the event from the terrain alone (the slip windows
+are on a slope; §5.3 shows the `foot_slip` probability already at 0.55 before the trigger). `mixed_field` puts
+several events on one map: `crust_collapse`'s sand-with-crusts template (30 % crusts) plus ice patches
+(`MIXED_ICE` = 0.15, no random single-foot slips) on the hardpan between them. Its trigger is `any_event`; the
+event of a window is the logged flag at the trigger frame (`classify.py:mixed_event`).
 
 ## 4. Deviations
 
@@ -198,8 +242,90 @@ and slides: `analysis/report.md`, `analysis/v2_slides.pptx` there.
 videos, so trigger effects are read from the data. Trigger window counts are paced, not natural rates. Energy's
 success on flat types is time-outs while circling (as in §5.1).
 
+### 5.3 Offline: signal labels, taxonomy, classification (2026-10-31, no new simulation)
+
+Data: the 434 falls of `terrain_v1` and v2 with ≥ 1.5 s before the balance loss, and the 2000 v2 trigger windows.
+Scripts `scripts/forge/surveillance/taxonomy.py` and `classify.py`; outputs `results/taxonomy_v1`,
+`results/classify_v1`; full write-up `results/overnight_2026-10-31/REPORT.md`.
+
+1. **Signal labels** per frame: the A–E rules of `analyze.py` (thresholds per policy from the v2 `random_walk`
+   windows) plus privileged ones (two stance feet sliding, 5 cm sinkage, front / hind / thigh contact, one foot
+   down). Failure mode per fall by a priority list over the second before the balance loss (`failure_mode`): Robust
+   `gravel_field` 62 / 63 `upright_hit`; `slip_slope` splits into `slide`, `support_loss`, `leg_collision`,
+   `foot_trap`.
+2. **Clustering** (Ward on label shares in 0.5 s bins, aligned at the balance loss): silhouette 0.23–0.29 for every
+   k = 3–10, i.e. no strong natural clusters; aligned at the base contact instead, the clusters split one mechanism
+   by how long the fall took. A random forest on the same features names the terrain at 0.66 balanced accuracy
+   (chance 0.17), the trigger event at 0.61 (chance 0.20).
+3. **From proprioception only**: the fall's mode at 0.58 (1 s before the balance loss) to 0.64 (+0.25 s) balanced
+   accuracy, against 0.48 from policy + terrain alone. Event onset within its own terrain: crust collapse AUROC
+   0.80–0.86 after 0.5 s, sand, stone and slip 0.4–0.73 (near chance). §5.4 shows that the near-chance slip and
+   sand numbers came mostly from wrong labels, not from missing signal.
+
+### 5.4 Campaign `v3_hard` (2026-10-31, `-Hard` tasks)
+
+All 22 (policy, terrain) plays of the Hard tasks, 10 min of sim or 100 falls, 100 trigger windows each; 2 h on two
+holders. Fetched to `results/euler/isaaclab3/surveillance/v3_hard` (`report.md`); analysis in
+`results/taxonomy_v3`, `results/classify_v3`.
+
+**Falls: 726 (v2: 25).** Falls per play (Robust / Energy):
+
+| Terrain | Robust | Energy | Terrain | Robust | Energy |
+| --- | --- | --- | --- | --- | --- |
+| slip_field | 100 (stopped) | 100 (stopped) | rough_stairs | 100 (stopped) | 100 (stopped) |
+| slip_slope | 100 (stopped) | 13 | rough_slope | 28 | 51 |
+| mixed_field | 12 | 5 | pit_field | 0 | 38 |
+| gravel_field | 5 | 38 | rough_field | 0 | 31 |
+| crust_collapse | 1 | 3 | stub_field | 1 | 0 |
+| sand_field | 0 | 0 | | | |
+
+Ice and the steepest stairs fail both policies; Robust walks through deep sand, collapsing crusts, stubs and pits.
+
+**Pre-trigger frames were not normal.** The trigger fires on a rising edge, at most once per 5 s window per robot,
+so on slip and sand maps it often fired while the robot was already crossing an ice cell or a sand patch (one foot
+leaving and the next entering). From the logged flags, a foot was on ice or in sand in the second *before* the
+trigger in 63–77 % (slip), 61–72 % (mixed), 21–47 % (sand) of the frames, and in 1–5 % for the crust collapse (a
+single-frame event): the "normal" class held the event itself. Two fixes:
+
+1. `classify.py` labels every frame from the privileged flags when a collection has them (`frame_labels`), and the
+   onset AUROC leaves out pre-trigger frames with a flagged event.
+2. `collect.py --trigger_quiet_s` (default 1 s): a rising edge counts only after the trigger was off that long, so
+   new windows are centered on onsets (campaign `v3_onsets`).
+
+**Onset AUROC with the flag labels** (MLP on 0.5 s of proprioception, within the event's own maps; delay after the
+trigger 0.5 s / 1.0 s; with the trigger-relative labels in brackets):
+
+| Event | Robust | Energy |
+| --- | --- | --- |
+| foot_slip (slip maps + mixed) | 0.92 / 0.92 (0.57 / 0.53) | 0.76 / 0.72 |
+| foot_slip, `mixed_field` only | 0.63 / 0.74 | 0.88 / 0.87 (0.27 / 0.32) |
+| sand_sink (sand + crust + mixed) | 0.81 / 0.87 (0.74 / 0.77) | 0.72 / 0.81 |
+| crust_collapse | 0.81 / 0.89 | 0.84 / 0.85 |
+| stone_step (no flag) | 0.62 / 0.75 | 0.61 / 0.50 |
+
+Each test split holds ~15 windows per event, so these are ±0.1; `v3_onsets` collects 1000 windows per map. The
+per-frame 5-class classifier (normal, crust, slip, sand, stone; event maps) reaches 0.62 (Robust) / 0.59 (Energy)
+balanced test accuracy, with 31–46 % of the normal frames called an event.
+
+**Taxonomy.** With the logged flags as features, the trigger windows cluster by event (Robust: an ice cluster, a
+sand/crust cluster with leg contacts, and the rest; ARI vs the trigger 0.51 (Energy 0.42); a random forest names
+it at 0.85 (0.78) balanced accuracy, chance 0.17). The `sink_5cm` label now requires the foot to stay within 5 cm of
+its touchdown point: a foot sliding down a slope also ends up lower, and had made 46 slip falls `foot_trap`. Failure modes of the 726 falls:
+support_loss 296, leg_collision 202, other 127, slide 84, foot_trap 11, upright_hit 6 (Robust stairs: 60 of 100
+leg_collision).
+
+**Fall mode from proprioception** (random forest, 5-fold): 0.30 (1 s before the balance loss), 0.33 (−0.25 s),
+0.51 (at it), 0.50 (+0.25 s) balanced accuracy, against 0.53 from policy + terrain alone. Before the balance loss
+the proprioception does not tell how the robot will fall; v1's higher numbers (0.58–0.64) came from its 68 easy
+`upright_hit` gravel falls.
+
 ## 6. Changelog
 
+- 2026-10-31 (evening): GPU smoke of the Hard tasks; sand stiffness 200–800 → 60–240 N/m (§3.5). Campaign
+  `v3_hard` (§5.4). Reason: the user's request (verify on the GPU).
+- 2026-10-31: `-Hard` variants (§3.5), `mixed_field` and its `any_event` trigger (§3.6). Not yet run on the GPU.
+  Reason: the 2026-10-26 meeting (fix the terrain events, harder stairs / holes / stubs, general self-supervised
+  failure classes).
 - 2026-10-26: New terrain type `slip_field` (rough_field + slips), 10 types; trigger `foot_slip` on `slip_slope`
   and `slip_field`. Slips now come from `forge/terrain`'s new default (2 % per touchdown, one stance long), not an
   override here. Reason: the user's request.

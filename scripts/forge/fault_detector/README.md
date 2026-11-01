@@ -36,6 +36,9 @@ euler -p isaaclab3fd fetch fault_detector/results   # -> results/euler/isaaclab3
 - `collect.py`: `--num_episodes`, `--output_dir`, injector overrides `--p_fault`, `--fault_types a=x b=y`,
   `--power_loss_health lo hi`, `--passive_damping`, plus `play.py`'s (`--num_envs`, `--seed`, `--checkpoint`).
   The terrain mesh is always seeded with 0; `--seed` sets the env seed and so the fault schedule.
+- `experiment.py debounce <exp_dir>`: each run's trade-off per debounce $k$ alone ($\tau$ set per $k$ on
+  validation, scored on `test_id`), `<exp_dir>/debounce/debounce.{md,png,json}`; results in
+  `forge/fault_detector/motor_degrade_detector/REPORT.md` §5.
 - `experiment.py matrix <exp_dir> [key=value ...]`: any `DetectorCfg` field (`detector.py`), e.g. `epochs=10`,
   `size=large`, `history_length=5`, `extra_terms='["tracking_error"]'`; `--archs`, `--obs_sets`, `--seeds` select runs.
   Finished runs (with `metrics.json`) are skipped, so a rerun resumes an interrupted matrix.

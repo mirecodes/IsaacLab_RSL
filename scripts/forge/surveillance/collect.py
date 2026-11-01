@@ -89,6 +89,8 @@ class FaultRecorder(RecorderTerm):
         self.num_events = 0
         self.num_terminal = 0
         self._buffers: dict[str, torch.Tensor] | None = None
+        self._terrain_event = None
+        """The terrain event term (``forge/terrain`` maps), False without one; looked up at the first sample."""
         self._ptr = 0
         self.grace_frames = round(cfg.grace_s / env.step_dt)
         self._length = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
@@ -104,6 +106,9 @@ class FaultRecorder(RecorderTerm):
         self._wait = torch.full_like(self._length, -1)
         """Frames until a started trigger window is saved; -1: none."""
         self._since_trigger = torch.full_like(self._length, self.num_frames)
+        self.quiet_frames = round(cfg.trigger_quiet_s / env.step_dt)
+        self._quiet = torch.zeros_like(self._length)
+        """Frames the trigger has been off."""
         if self.trigger is not None:
             self._new_index(self._trigger_dir)
         self.episodes: list[dict] = []
@@ -172,6 +177,16 @@ class FaultRecorder(RecorderTerm):
                 frame[f"obs_{group}"] = obs
         if self.value_fn is not None:
             frame["value"] = self.value_fn(env.obs_buf)
+        # privileged state of the terrain event (forge/terrain's terrain_step), per foot: labels and the stone replay
+        if self._terrain_event is None:
+            terms = [name for names in env.event_manager.active_terms.values() for name in names]
+            self._terrain_event = env.event_manager.get_term_cfg("terrain").func if "terrain" in terms else False
+        event = self._terrain_event
+        if event:
+            frame.update(terrain_foot_mu=event.foot_mu, terrain_low_mu=event.low_mu, terrain_on_ice=event.on_ice,
+                         terrain_in_sand=event.in_sand, terrain_collapse=event.collapse_event)  # fmt: skip
+            if event.rocks is not None:
+                frame["rock_pose_w"] = event.rocks.data.body_link_pose_w.torch
         return frame
 
     def record_post_step(self):
@@ -203,8 +218,10 @@ class FaultRecorder(RecorderTerm):
         return None, None
 
     def _update_triggers(self, in_contact: torch.Tensor) -> None:
-        """Save the trigger windows that are complete; start one on a rising edge of the trigger, for robots with
-        enough history for a full window, at least a window after their last trigger, within the budget: at most
+        """Save the trigger windows that are complete; start one on a rising edge of the trigger after it has been off
+        for ``trigger_quiet_s`` (an onset, not a foot re-entering an ice cell or a sand patch the robot is already
+        crossing), for robots with enough history for a full window, at least a window after their last trigger,
+        within the budget: at most
         ``max_triggers``, and with ``pace_steps`` at most ``max_triggers * step / pace_steps`` so far (spread over
         the play)."""
         env, cfg = self._env, self.cfg
@@ -215,8 +232,9 @@ class FaultRecorder(RecorderTerm):
             self._save(due, in_contact[due], triggers=True)
             self._wait[due] = -1
         signal = self.trigger(env)
-        rising = signal & ~self._signal
+        rising = signal & ~self._signal & (self._quiet >= self.quiet_frames)
         self._signal = signal
+        self._quiet = torch.where(signal, 0, self._quiet + 1)
         budget = cfg.max_triggers
         if cfg.pace_steps:
             budget = min(budget, math.ceil(cfg.max_triggers * env.common_step_counter / cfg.pace_steps))
@@ -238,6 +256,7 @@ class FaultRecorder(RecorderTerm):
         # a trigger window cut by the reset is dropped (a fall inside it is a failure event)
         self._wait[ids] = -1
         self._signal[ids] = False
+        self._quiet[ids] = 0
         return None, None
 
     def _log_episodes(self, ids: torch.Tensor, running: bool = False) -> None:
@@ -337,6 +356,7 @@ class FaultRecorderCfg(RecorderTermCfg):
     grace_s: float = 1.0
     contact_onsets: bool = False
     max_triggers: int = 0
+    trigger_quiet_s: float = 1.0
     pace_steps: int | None = None
 
 
@@ -381,6 +401,7 @@ def configure_env(env_cfg, fault_args: argparse.Namespace, output_dir: str) -> N
             grace_s=fault_args.grace_s,
             contact_onsets=fault_args.contact_onsets,
             max_triggers=fault_args.max_triggers,
+            trigger_quiet_s=fault_args.trigger_quiet_s,
             pace_steps=fault_args.max_steps,
         )
     )
@@ -474,6 +495,9 @@ def main() -> None:
     parser.add_argument("--contact_onsets", action="store_true", help="Also record non-foot contact onsets.")
     parser.add_argument(
         "--max_triggers", type=int, default=0, help="Also record up to this many event-trigger windows (triggers/)."
+    )
+    parser.add_argument(
+        "--trigger_quiet_s", type=float, default=1.0, help="A trigger counts only after being off this long [s]."
     )
     parser.add_argument("--disturbances", action="store_true", help="Keep the task's pushes and external wrench.")
     parser.add_argument("--sub_terrains", nargs="+", default=None, help="Keep only these sub-terrains.")

@@ -52,6 +52,12 @@ def stone_step(env, threshold: float = 1.0, clearance: float = 0.02) -> torch.Te
     return (loaded & near & raised).any(dim=1)
 
 
+def any_event(env) -> torch.Tensor:
+    """Any of :func:`crust_collapse`, :func:`sand_sink`, :func:`foot_slip` (``mixed_field``); which one is in the
+    window's logged terrain flags (``collect.py``: ``terrain_collapse``, ``terrain_in_sand``, ``terrain_on_ice``)."""
+    return crust_collapse(env) | sand_sink(env) | foot_slip(env)
+
+
 def random_walk(env, period_s: float = 5.0) -> torch.Tensor:
     """No event: fires at random, on average once per ``period_s`` per robot, to sample normal walking."""
     return torch.rand(env.num_envs, device=env.device) < env.step_dt / period_s

@@ -143,6 +143,13 @@ every 6 s) that lasts one stance; the next touchdown restores `μ_nominal` with 
 on leaving the grid or on reset. With `resample_on_touchdown=False` the draw is once per entry (in practice once
 per foot and episode; the default before 2026-10-26, with `slip_prob` 0.75). Only the changed environments' foot shapes are written.
 
+**Ice patches** (`ice_frac` > 0, default 0: off). The map is cut into `ice_cell` = 2 m squares from its corner; a
+share `ice_frac` of them, drawn once from the world seed, is icy with its own `μ_ice ~ U(0.05, 0.15)`. A touchdown on
+an ice cell takes that cell's `μ_ice` instead of the slip draw (`low_mu` and `on_ice` set), so every foot that steps
+on the patch slips together, and a robot walking onto ice loses grip on two to four feet within one gait cycle
+instead of one random foot. With ice the slip physics runs on any zone (on a sand slab the slab's own μ 0.6 wins by
+contact priority).
+
 **Sand** (sand patches). A foot is in the sand if it is over a soft patch footprint and `z_foot < s + r_foot`. Then
 `F_xy = -c_drag(d) v_xy`, `F_z = -c_suction(d) max(v_z, 0)` (c_drag 20–80, c_suction 30–150 N s/m), capped at 60 N,
 applied in the world frame through the robot's permanent wrench composer; all other feet get exactly 0.
@@ -161,7 +168,8 @@ the free spot with the most clearance among 8 random spots 1.2–3 m ahead (with
 clamped to the tile grid), dropped 1 cm above the highest ground under them. The robust policy's foot scanners see only the global terrain
 (`global_world_only`), so the stones are invisible to it and a moved stone never pops into its view.
 
-The event's per-foot state (`foot_mu`, `low_mu`, `in_sand`, `collapse_event`) is public, for analyses that want it.
+The event's per-foot state (`foot_mu`, `low_mu`, `on_ice`, `in_sand`, `collapse_event`) is public, for analyses
+that want it (`scripts/forge/surveillance/collect.py` logs it).
 
 ## 4. Deviations
 
@@ -316,6 +324,10 @@ touched the stairs and slopes at the platform edge within 1 s); dynamic rocks 15
 
 ## 6. Changelog
 
+- 2026-10-31: `SlipCfg.ice_frac / ice_cell / ice_mu`: ice patches (default off, so every map is unchanged); the event
+  keeps `on_ice` per foot. Not yet run on the GPU (Euler unreachable that night; code path checked on the Mac CPU
+  container only). Reason: the 2026-10-26 meeting (single-foot slips at 2 % never felled a robot; "define
+  low-friction areas instead").
 - 2026-10-26: Slip default: drawn at every touchdown (`resample_on_touchdown=True`), low with `slip_prob` 0.02
   instead of 0.75 once per foot and episode; a slip lasts one stance. The T3 slide ratio (§5) was measured with the
   old default and not rerun. Reason: the user's request (rare random slips, friction restored afterwards).

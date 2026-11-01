@@ -54,9 +54,9 @@ def terrains() -> list[str]:
     ]
 
 
-def task_id(terrain: str, policy: str) -> str:
+def task_id(terrain: str, policy: str, hard: bool = False) -> str:
     """As ``forge/surveillance/__init__.py:task_id``."""
-    return f"IsaacContrib-Surveillance-{terrain.title().replace('_', '')}-{policy}"
+    return f"IsaacContrib-Surveillance-{terrain.title().replace('_', '')}-{policy}" + ("-Hard" if hard else "")
 
 
 def summarize(episodes: list[dict], difficulty_range=None, num_rows: int = 0) -> dict:
@@ -100,7 +100,7 @@ def enqueue(args: argparse.Namespace) -> None:
         for terrain in args.terrains:
             out = f"{LOGS}/surveillance/{args.name}/{policy}/{terrain}"
             collect = [
-                "python", f"{SCRIPTS}/collect.py", "--task", task_id(terrain, policy),
+                "python", f"{SCRIPTS}/collect.py", "--task", task_id(terrain, policy, args.hard),
                 "--checkpoint", CHECKPOINTS[policy], "--output_dir", out,
                 # A2 policy step 0.02 s
                 "--max_events", str(args.failures), "--max_steps", str(round(args.minutes * 60 / 0.02)),
@@ -163,6 +163,7 @@ def main() -> None:
     q.add_argument("--minutes", type=float, default=10.0, help="Stop a play after this much sim time.")
     q.add_argument("--triggers", type=int, default=100, help="Event-trigger windows saved per play (0: none).")
     q.add_argument("--videos", type=int, default=10, help="Falls, and trigger windows, rendered per play.")
+    q.add_argument("--hard", action="store_true", help="The ...-Hard tasks: hardest rows, stronger terrain events.")
     q.add_argument("--dry_run", action="store_true", help="Print the euler commands only.")
     r = sub.add_parser("report", help="Tabulate the summaries of a fetched campaign.")
     r.add_argument("root", help="Local campaign directory (results/euler/<profile>/surveillance/<name>).")

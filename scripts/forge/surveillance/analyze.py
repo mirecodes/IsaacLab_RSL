@@ -80,8 +80,10 @@ RULES = [
 
 
 def load_collection(path: str) -> tuple[dict, list[dict]]:
-    """Return ``meta.json`` and the ``index.csv`` rows of a collection."""
-    with open(os.path.join(path, "meta.json")) as f:
+    """Return ``meta.json`` and the ``index.csv`` rows of a collection (or of its ``triggers/``, with the parent's
+    ``meta.json``)."""
+    meta_dir = path if os.path.isfile(os.path.join(path, "meta.json")) else os.path.dirname(path.rstrip("/"))
+    with open(os.path.join(meta_dir, "meta.json")) as f:
         meta = json.load(f)
     with open(os.path.join(path, "index.csv")) as f:
         rows = list(csv.DictReader(f))
