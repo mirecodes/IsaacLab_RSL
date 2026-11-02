@@ -31,7 +31,7 @@ state explained by the labels: physically coherent groups score high); ``outcome
 tip direction and time to the ground); detectability (5-fold balanced accuracy of a random forest that names the label
 from proprioception 0.5 s before and at the balance loss)::
 
-    R=results/euler/isaaclab3/surveillance/v3_hard
+    R=results/fetch/isaaclab3/surveillance/v3_hard
     uv run --no-project --with torch --with numpy --with scikit-learn --with matplotlib --with tslearn python \\
         scripts/forge/surveillance/sequences.py --out results/sequences_v3 --falls $R/*/* \\
         --normal $R/*/{rough_field,pit_field,stub_field,rough_slope,rough_stairs}
@@ -260,25 +260,46 @@ def kmeans(x: np.ndarray, k: int, seed: int = 0) -> np.ndarray:
     return KMeans(k, n_init=10, random_state=seed).fit_predict(x)
 
 
-def train_ae(z: np.ndarray, latent: int, epochs: int, seed: int, device: str) -> np.ndarray:
-    """1-D convolutional autoencoder of [N, T, S] sequences; returns the [N, latent] codes."""
+def train_ae(z: np.ndarray, latent: int, epochs: int, seed: int, device: str, nuisance: np.ndarray | None = None,
+             adversary_weight: float = 1.0) -> np.ndarray:  # fmt: skip
+    """1-D convolutional autoencoder of [N, T, S] sequences; returns the [N, latent] codes.
+
+    With ``nuisance`` (integer labels, e.g. the policy) the code is made invariant to it: the decoder gets the nuisance
+    as an input (so the code need not carry it), and an adversary predicts the nuisance from the code while the
+    encoder pushes the adversary's output towards uniform (weight ``adversary_weight``; a confidently wrong adversary
+    would still mean the code carries the nuisance).
+    """
     import torch
     from torch import nn
 
     torch.manual_seed(seed)
     x = torch.tensor(np.clip(z, -10, 10), dtype=torch.float32).transpose(1, 2).to(device)  # N, S, T
     s, t = x.shape[1], x.shape[2]
+    nc = 0 if nuisance is None else int(nuisance.max()) + 1
+    y = torch.as_tensor(nuisance if nc else np.zeros(len(z), int), device=device)
+    c = torch.eye(nc, device=device)[y] if nc else torch.zeros(len(z), 0, device=device)
     enc = nn.Sequential(nn.Conv1d(s, 32, 5, 2, 2), nn.ELU(), nn.Conv1d(32, 32, 5, 2, 2), nn.ELU(), nn.Flatten())
     flat = enc(x[:1].cpu()).shape[1]
     enc = nn.Sequential(enc, nn.Linear(flat, latent)).to(device)
-    dec = nn.Sequential(nn.Linear(latent, 128), nn.ELU(), nn.Linear(128, s * t)).to(device)
+    dec = nn.Sequential(nn.Linear(latent + nc, 128), nn.ELU(), nn.Linear(128, s * t)).to(device)
     opt = torch.optim.Adam([*enc.parameters(), *dec.parameters()], lr=1e-3, weight_decay=1e-5)
+    adv = nn.Sequential(nn.Linear(latent, 64), nn.ELU(), nn.Linear(64, max(nc, 1))).to(device)
+    opt_adv = torch.optim.Adam(adv.parameters(), lr=1e-3)
+    ce = nn.CrossEntropyLoss()
     for _ in range(epochs):
         for idx in torch.randperm(len(x), device=device).split(64):
-            loss = ((dec(enc(x[idx])).view(-1, s, t) - x[idx]) ** 2).mean()
+            code = enc(x[idx])
+            loss = ((dec(torch.cat([code, c[idx]], 1)).view(-1, s, t) - x[idx]) ** 2).mean()
+            if nc:
+                loss = loss - adversary_weight * adv(code).log_softmax(1).mean()
             opt.zero_grad()
             loss.backward()
             opt.step()
+            if nc:
+                adv_loss = ce(adv(code.detach()), y[idx])
+                opt_adv.zero_grad()
+                adv_loss.backward()
+                opt_adv.step()
     with torch.no_grad():
         return enc(x).cpu().numpy()
 
@@ -475,6 +496,11 @@ def main() -> None:
 
     code = train_ae(zl, latent=8, epochs=150, seed=args.seed, device=device)
     clusterers["ae"] = (lambda idx, k: kmeans(code[idx], k), lambda lab: silhouette_score(code, lab), np.arange(n))
+    # the same, made invariant to the policy (decoder conditioned on it + adversary on the code)
+    pol = np.unique([r["policy"] for r in rows], return_inverse=True)[1]
+    code_inv = train_ae(zl, latent=8, epochs=150, seed=args.seed, device=device, nuisance=pol)
+    clusterers["ae_inv"] = (lambda idx, k: kmeans(code_inv[idx], k), lambda lab: silhouette_score(code_inv, lab),
+                            np.arange(n))  # fmt: skip
 
     # privileged-state student on normal windows + falls (whole windows, standardized per policy)
     xs, ys = [], []

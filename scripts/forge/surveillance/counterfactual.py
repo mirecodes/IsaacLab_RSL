@@ -7,11 +7,18 @@
 different commands, and see which reaction avoids the fall.
 
 For each fall of one collection (rows of ``sequences.py``'s ``falls.csv``) the robot is put back into its logged state
-``--lead_s`` before the balance loss: root pose and velocity, joint positions and velocities, and the CPG phase and
-joint-target history of the Robust policy's action term. The velocity command is then held at the logged one
-(``continue``) or at zero (``stop``) for ``--horizon_s``, without terminations; the outcome is whether the base touches
-the ground. The same is done from the trigger frame of event windows that did not end in a fall (``control``): it
-measures how often the restore itself fells a robot. Robust only (the Energy policy has no command input)::
+``--lead_s`` before the balance loss: root pose and velocity, joint positions and velocities, the last actions, and
+the CPG phase and joint-target history of the Robust policy's action term. Then one reaction runs for
+``--horizon_s``, without terminations; the outcome is whether the base touches the ground. Reactions:
+
+- command (Robust only; the Energy policy has no command input): ``continue`` (the logged command), ``slow`` (half),
+  ``stop`` (zero), ``back`` (0.3 m/s backwards);
+- posture (both policies; the joint targets are overwritten after the action term): ``stand`` (default pose),
+  ``crouch`` (lower base), ``wide`` (hips abducted), each held for the whole horizon; ``pause`` (default pose for
+  0.5 s), ``crouch_1s`` and ``wide_1s`` (1 s), then the policy again with the logged command.
+
+The same is done from the trigger frame of event windows that did not end in a fall (``control``): it measures how
+often the restore itself, or the reaction, fells a robot::
 
     L=/workspace/isaaclab/logs/surveillance
     python scripts/forge/surveillance/counterfactual.py $L/v3_hard/Robust/slip_field --falls_csv $L/cf/falls.csv \\
@@ -43,7 +50,14 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper  # noqa: E402
 
 from isaaclab_tasks.utils import resolve_task_config  # noqa: E402
 
-FIELDS = ["collection", "kind", "event", "class", "reaction", "fell", "t_fall_s", "cmd_vx", "pos_err_0.2s"]
+FIELDS = ["collection", "kind", "event", "class", "reaction", "fell", "t_fall_s", "cmd_vx", "pos_err_0.2s",
+          "leg_contact", "tilt_end_deg", "tilt_max_deg", "travel_m"]  # fmt: skip
+COMMANDS = {"continue": 1.0, "slow": 0.5, "stop": 0.0}
+# joint offsets from the default pose (order of each leg: hip, thigh, calf; legs FL, FR, RL, RR)
+CROUCH, WIDE = [0.0, 0.3, -0.5] * 4, [0.25, 0.0, 0.0, -0.25, 0.0, 0.0] * 2
+POSTURES = {"stand": [0.0, 0.0, 0.0] * 4, "crouch": CROUCH, "wide": WIDE, "pause": [0.0, 0.0, 0.0] * 4,
+            "crouch_1s": CROUCH, "wide_1s": WIDE}  # fmt: skip
+HOLD_S = {"pause": 0.5, "crouch_1s": 1.0, "wide_1s": 1.0}  # posture only this long, then the policy again
 
 
 def items(collection: str, falls_csv: str, class_column: str, lead: int, controls: int) -> list[dict]:
@@ -78,8 +92,10 @@ def main() -> None:
     parser.add_argument("--lead_s", type=float, default=0.5)
     parser.add_argument("--horizon_s", type=float, default=3.0)
     parser.add_argument("--controls", type=int, default=20)
-    parser.add_argument("--reactions", nargs="+", default=["continue", "stop"], help="continue, stop or slow (half).")
+    parser.add_argument("--reactions", nargs="+", default=["continue", "stop"],
+                        choices=[*COMMANDS, "back", *POSTURES], help="See the module docstring.")  # fmt: skip
     parser.add_argument("--repeats", type=int, default=1, help="Restores per state (the terrain events are random).")
+    parser.add_argument("--num_envs", type=int, default=None, help="Parallel restores (default: the collection's).")
     parser.add_argument("--out", required=True)
     cf_args, argv = parser.parse_known_args(sys.argv[1:])
     with open(os.path.join(cf_args.collection, "meta.json")) as f:
@@ -91,7 +107,7 @@ def main() -> None:
     print(f"[cf] {len(todo)} restores from {cf_args.collection}", flush=True)
     if not todo:
         return
-    num_envs = meta["num_envs"]
+    num_envs = cf_args.num_envs or meta["num_envs"]
     args_cli = _parse_args(["--task", meta["task"], "--checkpoint", meta["checkpoint"], "--num_envs", str(num_envs),
                             "--seed", str(meta["seed"]), *argv])  # fmt: skip
     env_cfg, agent_cfg = resolve_task_config(args_cli.task, args_cli.agent, play_mode=False)
@@ -120,9 +136,21 @@ def main() -> None:
             base_env = env.unwrapped
             robot, contact = base_env.scene["robot"], base_env.scene["contact_forces"]
             base_id = contact.find_bodies(meta["body_names"][0])[0][0]
+            leg_ids = contact.find_bodies(".*_(thigh|calf)")[0]  # knees / shins on the ground: kneeling, not standing
             command = base_env.command_manager.get_term("base_velocity")
             command.compute = lambda dt: None  # hold the written command
             cpg = base_env.action_manager.get_term("joint_pos")
+            # posture reactions: overwrite the joint targets of the envs in ``hold`` after the action term wrote them
+            default = robot.data.default_joint_pos.torch
+            hold = {"ids": None, "target": None}
+            apply_actions = cpg.apply_actions
+
+            def apply_with_posture():
+                apply_actions()
+                if hold["ids"] is not None:
+                    robot.set_joint_position_target_index(target=hold["target"], env_ids=hold["ids"])
+
+            cpg.apply_actions = apply_with_posture
             active = [name for names in base_env.event_manager.active_terms.values() for name in names]
             terrain = base_env.event_manager.get_term_cfg("terrain").func if "terrain" in active else None
             dev = base_env.device
@@ -152,6 +180,9 @@ def main() -> None:
                             env_ids=ids)  # fmt: skip
                         robot.write_joint_position_to_sim_index(position=logged("joint_pos"), env_ids=ids)
                         robot.write_joint_velocity_to_sim_index(velocity=logged("joint_vel"), env_ids=ids)
+                        # private access: the last actions are part of the observation
+                        base_env.action_manager._action[ids] = logged("action")
+                        base_env.action_manager._prev_action[ids] = logged("action", -1)
                         # private access: the CPG term keeps its phase and target history as state
                         if hasattr(cpg, "_phase") and "action_joint_pos_phase" in data[0]:
                             cpg._phase[ids] = logged("action_joint_pos_phase")
@@ -167,25 +198,47 @@ def main() -> None:
                             terrain._in_slip[ids] = True  # no re-draw now; feet off the slip zone get "leave"
                             terrain._write_foot_mu(ids)
                         cmd = logged("command_base_velocity")
-                        if reaction != "continue":
-                            cmd = cmd * (0.5 if reaction == "slow" else 0.0)
+                        if reaction in COMMANDS:
+                            cmd = cmd * COMMANDS[reaction]
+                        elif reaction == "back":
+                            cmd = torch.zeros_like(cmd)
+                            cmd[:, 0] = -0.3
                         command.vel_command_b[ids] = cmd
+                        if reaction in POSTURES:
+                            hold["ids"] = ids
+                            hold["target"] = default[ids] + torch.tensor(POSTURES[reaction], device=dev)
+                        else:
+                            hold["ids"] = None
                         base_env.observation_manager.reset(ids)
                         obs = env.get_observations()
                         policy.reset(torch.ones(env.num_envs, dtype=torch.bool, device=dev))
                         t_fall = torch.full((len(batch),), float("nan"), device=dev)
+                        leg_hit = torch.zeros(len(batch), dtype=torch.bool, device=dev)
+                        tilt_max = torch.zeros(len(batch), device=dev)
+                        start_xy = logged("root_pos_w")[:, :2]
                         check = round(0.2 / dt)  # restore check: base position vs the log, 0.2 s later
                         for step in range(round(cf_args.horizon_s / dt)):
+                            if reaction in HOLD_S and step == round(HOLD_S[reaction] / dt):
+                                hold["ids"] = None
                             obs, _, _, _ = env.step(policy(obs))
-                            hit = contact.data.net_forces_w.torch[ids, base_id].norm(dim=-1) > 1.0
+                            forces = contact.data.net_forces_w.torch[ids]
+                            hit = forces[:, base_id].norm(dim=-1) > 1.0
                             t_fall = torch.where(hit & t_fall.isnan(), (step + 1) * dt, t_fall)
+                            leg_hit |= (forces[:, leg_ids].norm(dim=-1) > 1.0).any(1)
+                            up = (-robot.data.projected_gravity_b.torch[ids, 2]).clamp(-1, 1)
+                            tilt_max = torch.maximum(tilt_max, torch.rad2deg(torch.acos(up)))
                             if step + 1 == check:
                                 err = (robot.data.root_link_pos_w.torch[ids] - logged("root_pos_w", check)).norm(dim=-1)
-                        for it, tf, c, e in zip(batch, t_fall.tolist(), cmd[:, 0].tolist(), err.tolist()):
+                        tilt = torch.rad2deg(torch.acos((-robot.data.projected_gravity_b.torch[ids, 2]).clamp(-1, 1)))
+                        travel = (robot.data.root_link_pos_w.torch[ids, :2] - start_xy).norm(dim=-1)
+                        for i, (it, tf) in enumerate(zip(batch, t_fall.tolist())):
                             writer.writerow({"collection": cf_args.collection, "kind": it["kind"], "event": it["event"],
                                              "class": it["class"], "reaction": reaction, "fell": not np.isnan(tf),
-                                             "t_fall_s": tf, "cmd_vx": round(c, 3),
-                                             "pos_err_0.2s": round(e, 4)})  # fmt: skip
+                                             "t_fall_s": tf, "cmd_vx": round(cmd[i, 0].item(), 3),
+                                             "pos_err_0.2s": round(err[i].item(), 4),
+                                             "leg_contact": bool(leg_hit[i]), "tilt_end_deg": round(tilt[i].item(), 1),
+                                             "tilt_max_deg": round(tilt_max[i].item(), 1),
+                                             "travel_m": round(travel[i].item(), 3)})  # fmt: skip
                         f.flush()
                         fell = (~t_fall.isnan()).float()
                         kinds = np.array([it["kind"] for it in batch])

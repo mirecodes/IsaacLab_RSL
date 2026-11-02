@@ -153,7 +153,7 @@ as now (gym IDs then `IsaacContrib-Velocity-A2Deploy-*`, incline fix included) b
 falls**. Robust teacher `a2_robust_teacher_s0/model_2999`, energy teacher rough `a2_energy_teacher_rough_s0/model_2999`,
 terrain seed 42, Euler RTX 4090, Newton/MJWarp. Each play: 30 min sim or 200 base-contact falls, then up to 10 videos
 of falls evenly spread over sim time. Data: Euler `logs/fault_analysis/terrain_v1/<Policy>/<terrain>`, local
-`results/euler/isaaclab3/fault_analysis/terrain_v1` (2.1 GB; `report.md` there has every row). Success = an episode
+`results/fetch/isaaclab3/fault_analysis/terrain_v1` (2.1 GB; `report.md` there has every row). Success = an episode
 that ends by leaving its tile or by the 60 s time-out; level 1–3 = d 0.4 / 0.55 / 0.7 (inclines 0 / 11.25 / 22.5°).
 
 | Policy | Terrain | Success L1 / L2 / L3 | Falls | Mean time to fall [s] | Episodes | Sim / wall [min] | Videos |
@@ -210,7 +210,7 @@ inclines is flat (0°). The heading split counts the heading 5 s before the fall
 triggers saved full 250-frame windows). The current task: 10 types (`slip_field` added), 20 robots, 10 min sim or
 100 falls, 100 trigger windows, 10 + 10 videos. Same checkpoints, seed 42, Euler RTX 4090. All 20 plays ran the full
 10 min (3.33 robot-h each); the campaign took 2 h 24 min wall (collect 3.0–5.9 min and render 3.3–4.1 min per job).
-Data: Euler `logs/surveillance/v2`, local `results/euler/isaaclab3/surveillance/v2` (3.1 GB). Full analysis, figures
+Data: Euler `logs/surveillance/v2`, local `results/fetch/isaaclab3/surveillance/v2` (3.1 GB). Full analysis, figures
 and slides: `analysis/report.md`, `analysis/v2_slides.pptx` there.
 
 | Policy | Terrain | Success L1 / L2 / L3 | Falls | Falls / robot-h (95 % CI) | Episodes |
@@ -246,7 +246,8 @@ success on flat types is time-outs while circling (as in §5.1).
 
 Data: the 434 falls of `terrain_v1` and v2 with ≥ 1.5 s before the balance loss, and the 2000 v2 trigger windows.
 Scripts `scripts/forge/surveillance/taxonomy.py` and `classify.py`; outputs `results/taxonomy_v1`,
-`results/classify_v1`; full write-up `results/overnight_2026-10-31/REPORT.md`.
+`results/classify_v1` (both removed locally on 2026-11-02); full write-up
+`results/reports/surveillance/20261031_hard_terrain/REPORT.md`.
 
 1. **Signal labels** per frame: the A–E rules of `analyze.py` (thresholds per policy from the v2 `random_walk`
    windows) plus privileged ones (two stance feet sliding, 5 cm sinkage, front / hind / thigh contact, one foot
@@ -265,8 +266,8 @@ Scripts `scripts/forge/surveillance/taxonomy.py` and `classify.py`; outputs `res
 ### 5.4 Campaign `v3_hard` (2026-10-31, `-Hard` tasks)
 
 All 22 (policy, terrain) plays of the Hard tasks, 10 min of sim or 100 falls, 100 trigger windows each; 2 h on two
-holders. Fetched to `results/euler/isaaclab3/surveillance/v3_hard` (`report.md`); analysis in
-`results/taxonomy_v3`, `results/classify_v3`.
+holders. Fetched to `results/fetch/isaaclab3/surveillance/v3_hard` (`report.md`); analysis in
+`results/reports/surveillance/20261031_hard_terrain/data/{taxonomy_v3,classify_v3}`.
 
 **Falls: 726 (v2: 25).** Falls per play (Robust / Energy):
 

@@ -13,7 +13,7 @@ library only, so it runs on the Mac::
 
     python scripts/forge/surveillance/campaign.py enqueue --name v1        # queue 2 x 10 jobs
     euler fetch surveillance/v1
-    python scripts/forge/surveillance/campaign.py report results/euler/isaaclab3/surveillance/v1
+    python scripts/forge/surveillance/campaign.py report results/fetch/isaaclab3/surveillance/v1
 """
 
 import argparse
@@ -166,7 +166,7 @@ def main() -> None:
     q.add_argument("--hard", action="store_true", help="The ...-Hard tasks: hardest rows, stronger terrain events.")
     q.add_argument("--dry_run", action="store_true", help="Print the euler commands only.")
     r = sub.add_parser("report", help="Tabulate the summaries of a fetched campaign.")
-    r.add_argument("root", help="Local campaign directory (results/euler/<profile>/surveillance/<name>).")
+    r.add_argument("root", help="Local campaign directory (results/fetch/<profile>/surveillance/<name>).")
     args = parser.parse_args()
     if args.command == "enqueue":
         args.terrains = args.terrains or terrains()

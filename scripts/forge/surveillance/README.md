@@ -10,9 +10,10 @@ These scripts play a trained RSL-RL locomotion policy on many robots in parallel
 | [campaign.py](campaign.py) | Standard library only. Queues one collect + render job per (policy, terrain map) on Euler, and tabulates their `summary.json` files. |
 | [taxonomy.py](taxonomy.py) | Offline (numpy, scikit-learn, matplotlib). Per-frame signal labels (rules A–E + privileged state), failure mode per fall, window features, Ward clustering, separability of the known causes. |
 | [classify.py](classify.py) | Offline (torch, scikit-learn). Which event acts on the robot from proprioception only, labels from the triggers (class probability vs time since the trigger, onset AUROC); `--falls_csv`: failure mode of the falls from proprioception. |
-| [sequences.py](sequences.py) | Offline (torch, scikit-learn, tslearn). Taxonomy methods compared on the same falls: rules, first violated constraint, label shares + Ward (with / without the cause flags), DTW cost metrics (state, event labels, student latent), autoencoder latent, privileged-state student latent; scored by stability, NMI with terrain / policy, physical coherence, detectability beyond the context. Writes `falls.csv` with every method's label. |
+| [sequences.py](sequences.py) | Offline (torch, scikit-learn, tslearn). Taxonomy methods compared on the same falls: rules, first violated constraint, label shares + Ward (with / without the cause flags), DTW cost metrics (state, event labels, student latent), autoencoder latent (plain, and policy-invariant: decoder conditioned on the policy + adversary), privileged-state student latent; scored by stability, NMI with terrain / policy, physical coherence, detectability beyond the context. Writes `falls.csv` with every method's label. |
 | [detect.py](detect.py) | Offline (torch, scikit-learn). Early-detection strategies (supervised hazard, with IMU, with harmless events as negatives, per-mode hazard, forward-model anomaly, tilt, critic value) at a fixed false-alarm rate on normal walking: lead time before the balance loss per failure mode, alarms on harmless events, per-mode signatures. |
-| [counterfactual.py](counterfactual.py) | Isaac Lab, GPU. Restores the logged state before each recorded fall (Robust: root, joints, CPG phase) and replays the policy with the logged or a zero command: which reaction avoids the fall; control restores from windows without a fall. |
+| [reflex.py](reflex.py) | Isaac Lab, GPU. Closed-loop test of a precursor reflex for the Robust policy: on each terrain-event onset (privileged flags = a perfect onset detector), after a latency, the command is replaced (back / stop / slow) for a while; falls and forward progress per robot-minute against no reflex. Optional learned gate (`--gate_model`), random firing (`--fire_prob`), and onset logging for training a gate (`--log_onsets`). |
+| [counterfactual.py](counterfactual.py) | Isaac Lab, GPU. Restores the logged state before each recorded fall (root, joints, last actions; Robust also the CPG phase), then runs one reaction: command (continue / slow / stop / back, Robust only) or posture override of the joint targets (stand / crouch / wide / pause, both policies). Records base contact, max and final tilt, leg contact and distance travelled; control restores from windows without a fall. |
 | [test_analyze.py](test_analyze.py), [test_campaign.py](test_campaign.py) | Checks of the geometry helpers of `analyze.py` and of the summary of `campaign.py`. |
 
 ## Usage
@@ -23,7 +24,7 @@ These scripts play a trained RSL-RL locomotion policy on many robots in parallel
 python scripts/forge/surveillance/campaign.py enqueue --name v1    # 2 policies x 10 terrains = 20 jobs
 euler status                                                                 # jobs run one after another
 euler fetch surveillance/v1
-python scripts/forge/surveillance/campaign.py report results/euler/isaaclab3/surveillance/v1
+python scripts/forge/surveillance/campaign.py report results/fetch/isaaclab3/surveillance/v1
 ```
 
 Each job plays `IsaacContrib-Surveillance-<Type>-{Robust,Energy}` (`forge/surveillance`; robust teacher
@@ -69,7 +70,7 @@ python scripts/forge/surveillance/campaign.py enqueue --name smoke_trig --polici
     --terrains crust_collapse sand_field gravel_field slip_field --minutes 1 --triggers 10 --videos 2
 euler status
 euler fetch surveillance/smoke_trig
-python scripts/forge/surveillance/campaign.py report results/euler/isaaclab3/surveillance/smoke_trig
+python scripts/forge/surveillance/campaign.py report results/fetch/isaaclab3/surveillance/smoke_trig
 ```
 
 Check, per terrain:
@@ -86,10 +87,10 @@ falls are recorded either way.
 # 2. full campaign: 2 policies x 10 terrains = 20 jobs, each 10 min sim or 100 falls, 100 trigger windows
 python scripts/forge/surveillance/campaign.py enqueue --name v2
 euler fetch surveillance/v2
-python scripts/forge/surveillance/campaign.py report results/euler/isaaclab3/surveillance/v2
+python scripts/forge/surveillance/campaign.py report results/fetch/isaaclab3/surveillance/v2
 # optional: rule flags on the falls of one collection
 uv run --no-project --with numpy python scripts/forge/surveillance/analyze.py \
-    results/euler/isaaclab3/surveillance/v2/Robust/slip_slope
+    results/fetch/isaaclab3/surveillance/v2/Robust/slip_slope
 ```
 
 Record the results in `forge/surveillance/REPORT.md` §5 (a new §5.2, set up as §5.1) and in **Collections** below.
@@ -119,11 +120,11 @@ python scripts/forge/surveillance/campaign.py enqueue --name v3_hard --hard
 euler fetch surveillance/v3_hard
 # 3. taxonomy and classifiers on it (event labels now come from the logged flags)
 uv run --no-project --with numpy --with scikit-learn --with matplotlib python scripts/forge/surveillance/taxonomy.py \
-    --out results/taxonomy_v3 --falls results/euler/isaaclab3/surveillance/v3_hard/*/* \
-    --baseline results/euler/isaaclab3/surveillance/v2/*/{rough_field,pit_field,stub_field,rough_slope,rough_stairs}
+    --out results/reports/surveillance/20261031_hard_terrain/data/taxonomy_v3 --falls results/fetch/isaaclab3/surveillance/v3_hard/*/* \
+    --baseline results/fetch/isaaclab3/surveillance/v2/*/{rough_field,pit_field,stub_field,rough_slope,rough_stairs}
 uv run --no-project --with torch --with numpy --with scikit-learn --with matplotlib python \
-    scripts/forge/surveillance/classify.py results/euler/isaaclab3/surveillance/v3_hard/Robust/mixed_field \
-    --out results/classify_v3/Robust_mixed
+    scripts/forge/surveillance/classify.py results/fetch/isaaclab3/surveillance/v3_hard/Robust/mixed_field \
+    --out results/reports/surveillance/20261031_hard_terrain/data/classify_v3/Robust_mixed
 ```
 
 ### Single collections
@@ -141,14 +142,14 @@ euler enqueue fault_a2_robust -- python scripts/forge/surveillance/collect.py \
 euler enqueue fault_render -- python scripts/forge/surveillance/render.py \
     /workspace/isaaclab/logs/fault_analysis/a2_study_robust_teacher/<collection> --events 0 5 12
 
-euler fetch fault_analysis   # -> results/euler/isaaclab3/fault_analysis/... (events, terrain, videos)
+euler fetch fault_analysis   # -> results/fetch/isaaclab3/fault_analysis/... (events, terrain, videos)
 ```
 
 Replay on the Linux machine, in the local Isaac container. `docker-compose.codes.yaml` mounts `~/hyeslee/results` at `/workspace/results`:
 
 ```bash
 python scripts/forge/surveillance/render.py \
-    /workspace/results/euler/isaaclab3/fault_analysis/a2_study_robust_teacher/<collection> \
+    /workspace/results/fetch/isaaclab3/fault_analysis/a2_study_robust_teacher/<collection> \
     --events 12 --viz kit --real_time   # live window at wall-clock speed; the mp4 is written too
 ```
 
@@ -177,7 +178,7 @@ Run both scripts as queued jobs (`euler enqueue`), not `euler exec`: an `exec` s
 Flag the rules on a fetched collection. Any Python with numpy works (the Isaac container, or `uv run --no-project --with numpy python ...` on the Mac). It takes seconds for 300 events and about a minute for 3400:
 
 ```bash
-R=results/euler/isaaclab3/fault_analysis
+R=results/fetch/isaaclab3/fault_analysis
 # thresholds from normal walking: frames >= 2 s before the leg-contact onsets of the smoke collection
 python scripts/forge/surveillance/analyze.py $R/smoke/rough2
 # flag the failures against those thresholds
@@ -366,9 +367,15 @@ Choices the request left open, and how they were made here:
 
 ## Changelog
 
+- 2026-11-01 (afternoon): `counterfactual.py` adds the reactions `back`, `stand`, `crouch`, `wide` and `pause`, works
+  for the Energy policy (last actions restored), takes `--num_envs`, and records `tilt_max_deg`, `tilt_end_deg`,
+  `leg_contact` and `travel_m`. `sequences.py` adds `ae_inv`, an autoencoder made invariant to the policy. New
+  `reflex.py` (closed-loop precursor reflex). Reason:
+  the reaction axis of the taxonomy (`results/reports/surveillance/20261101_reactions_reflex/REPORT.md`). Base contact alone misses robots that
+  end on their side propped on their legs (25 % of the non-contact stair restores of Energy end tilted > 60°).
 - 2026-11-01: `sequences.py`, `detect.py`, `counterfactual.py`, `test_sequences.py`; `classify.py --stride`.
   Reason: the user's request (methods to categorize the failure sequences and to detect each category; write-up in
-  `results/methods_2026-11-01/REPORT.md`).
+  `results/reports/surveillance/20261101_taxonomy_detection/REPORT.md`).
 - 2026-10-31 (evening): `collect.py --trigger_quiet_s` (default 1 s; trigger windows start only at onsets);
   `classify.py` labels frames from the logged flags (`frame_labels`); `taxonomy.py` `sink_5cm` only straight down.
   Reason: in `v3_hard` the frames before a slip / sand trigger had the event in 21–77 % of the frames

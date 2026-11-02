@@ -18,7 +18,7 @@ class probability over the time since the trigger (how fast the right class rise
 accuracy at each delay::
 
     uv run --no-project --with torch --with numpy --with matplotlib python scripts/forge/surveillance/classify.py \\
-        results/euler/isaaclab3/surveillance/v2/Robust/* --out results/classify_v1/Robust
+        results/fetch/isaaclab3/surveillance/v2/Robust/* --out results/classify_v1/Robust
 """
 
 from __future__ import annotations

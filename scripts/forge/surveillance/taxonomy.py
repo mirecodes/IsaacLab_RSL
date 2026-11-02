@@ -15,8 +15,8 @@ on the event-trigger windows, whose event is known, check that the feature space
 
     uv run --no-project --with numpy --with scikit-learn --with matplotlib python \\
         scripts/forge/surveillance/taxonomy.py --out results/taxonomy_v1 \\
-        --falls results/euler/isaaclab3/fault_analysis/terrain_v1/*/* results/euler/isaaclab3/surveillance/v2/*/* \\
-        --baseline results/euler/isaaclab3/surveillance/v2/*/{rough_field,pit_field,stub_field}
+        --falls results/fetch/isaaclab3/fault_analysis/terrain_v1/*/* results/fetch/isaaclab3/surveillance/v2/*/* \\
+        --baseline results/fetch/isaaclab3/surveillance/v2/*/{rough_field,pit_field,stub_field}
 """
 
 from __future__ import annotations
