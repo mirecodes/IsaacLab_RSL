@@ -61,3 +61,15 @@ def any_event(env) -> torch.Tensor:
 def random_walk(env, period_s: float = 5.0) -> torch.Tensor:
     """No event: fires at random, on average once per ``period_s`` per robot, to sample normal walking."""
     return torch.rand(env.num_envs, device=env.device) < env.step_dt / period_s
+
+
+def fault_or_event(env, walk_period_s: float = 30.0) -> torch.Tensor:
+    """The ``-Faults`` tasks: a motor fault started (``fault_injector`` label ``steps_since_onset`` >= 0), a foot is
+    held by the foot-stuck anchor, :func:`any_event` (a terrain event, on the maps that have one), or
+    :func:`random_walk` once per ``walk_period_s`` for nominal windows. Which one is in the window's logged labels
+    (``obs_fault``, ``obs_foot_stuck``, terrain flags)."""
+    motor = env.event_manager.get_term_cfg("motor_fault").func.labels()
+    stuck = env.event_manager.get_term_cfg("foot_stuck").func.labels()
+    # motor labels [fault_mask (J), fault_type, health (J), onset_step, steps_since_onset, severity]: column -2
+    # foot-stuck labels [stuck_mask (F = 4), mode, ...]: the first 4 columns
+    return (motor[:, -2] >= 0) | (stuck[:, :4] > 0).any(dim=1) | any_event(env) | random_walk(env, walk_period_s)

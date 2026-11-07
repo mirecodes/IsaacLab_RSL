@@ -14,8 +14,11 @@ import math
 from collections.abc import Callable
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.utils import configclass
 
+from isaaclab_tasks.forge.fault_injector.foot_stuck import FootStuckInjectorCfg, add_foot_stuck
+from isaaclab_tasks.forge.fault_injector.injector import MotorFaultInjectorCfg, add_motor_faults
 from isaaclab_tasks.forge.terrain.env_cfg import A2EnergyTerrainEnvCfg, A2RobustTerrainEnvCfg
 from isaaclab_tasks.forge.terrain.templates.rough_field import RoughFieldCfg
 from isaaclab_tasks.forge.terrain.templates.sand import SandFieldCfg
@@ -161,7 +164,53 @@ class A2EnergyDeployEnvCfg(A2EnergyTerrainEnvCfg):
 
 POLICIES = {"Robust": A2RobustDeployEnvCfg, "Energy": A2EnergyDeployEnvCfg}
 
+FAULT_ONSET_S = (3.0, 12.0)
+"""Onset range of the injected faults [s after the reset]: at least half a 5 s trigger window of history before it
+(``collect.py`` needs 2.5 s), and within the shortest episodes (robots leave their tile after ~30 s)."""
 
-def make_env_cfg(terrain: str, policy: str, hard: bool = False):
-    """The env cfg of ``IsaacContrib-Surveillance-<terrain>-<policy>`` (``hard``: ``...-Hard``)."""
-    return POLICIES[policy](terrain_world=deploy_world(terrain, hard))
+
+FOOT_STUCK_SEED = 7919
+"""Seed of the foot-stuck schedule (chosen here; any value other than the env seed)."""
+
+
+MILD_POWER_LOSS_H = (0.6, 0.85)
+"""Health range of the ``-FaultsMild`` variant: above the default power-loss range U[0.1, 0.6] (out of a detector's
+training range, and harder to see)."""
+
+
+def apply_faults(env_cfg, mild: bool = False) -> None:
+    """The ``-Faults`` variant: the motor fault and the foot-stuck injector of ``forge/fault_injector`` (each in 40 %
+    of the episodes, drawn independently, so 16 % have both), and the trigger :func:`mdp.fault_or_event`. Both
+    injectors run the actuators in Isaac Lab (``use_newton_actuators = False``)."""
+    if mild:
+        # chosen here: a mild power loss in 70 % of the episodes, no stuck feet
+        mild_cfg = MotorFaultInjectorCfg(
+            p_fault=0.7,
+            fault_types={"power_loss": 1.0},
+            power_loss_health=MILD_POWER_LOSS_H,
+            onset_time_s=FAULT_ONSET_S,
+        )
+        add_motor_faults(env_cfg, mild_cfg)
+        add_foot_stuck(env_cfg, FootStuckInjectorCfg(p_stuck=0.0, onset_time_s=FAULT_ONSET_S, seed=FOOT_STUCK_SEED))
+    else:
+        # chosen here: 40 % each, so that faults, terrain events and nominal walking all have many windows
+        add_motor_faults(env_cfg, MotorFaultInjectorCfg(p_fault=0.4, onset_time_s=FAULT_ONSET_S))
+        # its own seed: with the env seed of the motor injector, both draw the same numbers (always together)
+        add_foot_stuck(env_cfg, FootStuckInjectorCfg(p_stuck=0.4, onset_time_s=FAULT_ONSET_S, seed=FOOT_STUCK_SEED))
+    env_cfg.event_trigger = mdp.fault_or_event
+    # the energy policy's PD-gain randomization needs Newton actuators, which the injectors turn off: drop it and feed
+    # its motor-strength extrinsics the nominal 1
+    if getattr(env_cfg.events, "pd_gains", None) is not None:
+        env_cfg.events.pd_gains = None
+        for group in vars(env_cfg.observations).values():
+            if getattr(group, "motor_strength", None) is not None:
+                group.motor_strength = ObsTerm(func=mdp.nominal_motor_strength)
+
+
+def make_env_cfg(terrain: str, policy: str, hard: bool = False, faults: str = ""):
+    """The env cfg of ``IsaacContrib-Surveillance-<terrain>-<policy>`` (``hard``: ``...-Hard``, ``faults``:
+    ``"Faults"`` or ``"FaultsMild"`` for ``...-Faults`` / ``...-FaultsMild``)."""
+    env_cfg = POLICIES[policy](terrain_world=deploy_world(terrain, hard))
+    if faults:
+        apply_faults(env_cfg, mild=faults == "FaultsMild")
+    return env_cfg

@@ -52,7 +52,7 @@ euler enqueue tr_smoke -- python $P/probe.py smoke --terrain rough_slope --check
 # 3. look at a map: overview_{a,b}.png, tile_level<i>_d<d>.png, robot_level<i>_d<d>.png
 euler enqueue tr_view -- python $P/probe.py view /workspace/isaaclab/logs/terrain/view/rough_slope \
     --terrain rough_slope --checkpoint $CK
-rsync -a euler:/cluster/project/rsl/hyelee/euler-toolkit/isaaclab3/logs/terrain/view logs/terrain/
+rsync -a euler:/cluster/work/rsl/hyelee/euler-toolkit/isaaclab3/logs/terrain/view logs/terrain/
 
 # 4. play a trained policy on one terrain type and record failures (fault_analysis, unchanged)
 euler enqueue fault_slope -- python scripts/forge/surveillance/collect.py \

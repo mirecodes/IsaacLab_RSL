@@ -45,7 +45,7 @@ import explore as xp  # noqa: E402
 TASK = "IsaacContrib-FaultDetector-MotorFailure-A2Robust"
 DETECTORS = (
     "logs/fault_detector/results/tmp_explore/phase1/CJ_s0",  # on Euler, or copied there
-    "../../results/euler/isaaclab3fd/fault_detector/results/tmp_explore/phase1/CJ_s0",  # `euler fetch` from the repo
+    "../../results/euler/isaaclab3priority/fault_detector/results/tmp_explore/phase1/CJ_s0",  # `euler fetch` from the repo
 )
 POLICY = ("../../results/euler/isaaclab3/rsl_rl/a2_study_robust_teacher/2026-10-23_11-54-58_a2_robust_teacher_s0/"
           "model_2999.pt")  # fmt: skip

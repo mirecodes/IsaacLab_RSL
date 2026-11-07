@@ -51,6 +51,7 @@ from tensordict import TensorDict  # noqa: E402
 
 from isaaclab.app import launch_simulation  # noqa: E402
 from isaaclab.managers import RecorderTerm, RecorderTermCfg  # noqa: E402
+from isaaclab.managers import ObservationTermCfg as ObsTerm  # noqa: E402
 from isaaclab.managers import TerminationTermCfg as DoneTerm  # noqa: E402
 from isaaclab.managers.recorder_manager import DatasetExportMode, RecorderManagerBaseCfg  # noqa: E402
 from isaaclab.utils import configclass, to_dict  # noqa: E402
@@ -374,6 +375,10 @@ def left_tile(env, half_size: float) -> torch.Tensor:
     return offset.abs().amax(dim=1) > half_size
 
 
+def zero_input(env, dim: int) -> torch.Tensor:
+    return torch.zeros(env.num_envs, dim, device=env.device)
+
+
 def configure_env(env_cfg, fault_args: argparse.Namespace, output_dir: str) -> None:
     """Training env on a fixed terrain, with only the ``--terminations`` failure terms, without disturbances, with
     the fault recorder. On a terrain map, leaving the spawn tile ends the episode as a success (a time-out), so every
@@ -502,6 +507,8 @@ def main() -> None:
     parser.add_argument("--disturbances", action="store_true", help="Keep the task's pushes and external wrench.")
     parser.add_argument("--sub_terrains", nargs="+", default=None, help="Keep only these sub-terrains.")
     parser.add_argument("--output_dir", default=None, help="Default: logs/surveillance/<experiment>/<time>_<run>.")
+    parser.add_argument("--extra_obs", type=int, default=0, help="Append this many zeros to the policy input, for a "
+                        "policy trained with a flag or mode input (forge/velocity/a2_leg_guard).")  # fmt: skip
     fault_args, argv = parser.parse_known_args(sys.argv[1:])
     args_cli = _parse_args(argv)
 
@@ -525,6 +532,8 @@ def main() -> None:
             )
         )  # fmt: skip
         configure_env(env_cfg, fault_args, output_dir)
+        if fault_args.extra_obs:
+            env_cfg.observations.policy.extra_zeros = ObsTerm(func=zero_input, params={"dim": fault_args.extra_obs})
 
         env = create_isaaclab_env(args_cli.task, env_cfg, args_cli, convert_marl_to_single_agent=False)
         try:

@@ -8,4 +8,5 @@
 from .commands import SteeringCommand, SteeringCommandCfg
 from .curriculums import random_tile
 from .events import reset_root_up_or_down
-from .triggers import any_event, crust_collapse, foot_slip, random_walk, sand_sink, stone_step
+from .observations import nominal_motor_strength
+from .triggers import any_event, crust_collapse, fault_or_event, foot_slip, random_walk, sand_sink, stone_step

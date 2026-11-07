@@ -16,21 +16,21 @@ GRU detectors that output one fault probability per joint from the last $H = 3$ 
 
 ## Usage
 
-On Euler, profile `isaaclab3fd` (own queue and holder, same image and code as `isaaclab3`; the robust-teacher
+On Euler, profile `isaaclab3priority` (own queue and holder, same image and code as `isaaclab3`; the robust-teacher
 checkpoint was copied into its `logs/`):
 
 ```bash
 # `enqueue` quotes each argument, so a command with && goes through bash -c "..."
 CKPT=/workspace/isaaclab/logs/rsl_rl/a2_study_robust_teacher/2026-10-23_11-54-58_a2_robust_teacher_s0/model_2999.pt
 COLLECT="python scripts/forge/fault_detector/collect.py --task IsaacContrib-FaultDetector-MotorFailure-A2Robust --checkpoint $CKPT"
-euler -p isaaclab3fd enqueue fd_main -- bash -c "$COLLECT --num_episodes 16384 --seed 0 --output_dir logs/fault_detector/data/main"
-euler -p isaaclab3fd enqueue fd_test_id -- bash -c "$COLLECT --num_episodes 2048 --num_envs 2048 --seed 1 --output_dir logs/fault_detector/data/test_id"
-euler -p isaaclab3fd enqueue fd_test_ood -- bash -c "$COLLECT --num_episodes 2048 --num_envs 2048 --seed 2 \
+euler -p isaaclab3priority enqueue fd_main -- bash -c "$COLLECT --num_episodes 16384 --seed 0 --output_dir logs/fault_detector/data/main"
+euler -p isaaclab3priority enqueue fd_test_id -- bash -c "$COLLECT --num_episodes 2048 --num_envs 2048 --seed 1 --output_dir logs/fault_detector/data/test_id"
+euler -p isaaclab3priority enqueue fd_test_ood -- bash -c "$COLLECT --num_episodes 2048 --num_envs 2048 --seed 2 \
     --fault_types power_loss=1 --power_loss_health 0.6 0.8 --output_dir logs/fault_detector/data/test_ood"
-euler -p isaaclab3fd enqueue fd_matrix -- bash -c "python scripts/forge/fault_detector/experiment.py sanity logs/fault_detector/data/main \
+euler -p isaaclab3priority enqueue fd_matrix -- bash -c "python scripts/forge/fault_detector/experiment.py sanity logs/fault_detector/data/main \
     && python scripts/forge/fault_detector/experiment.py matrix logs/fault_detector/results/v1 \
     && python scripts/forge/fault_detector/experiment.py report logs/fault_detector/results/v1"
-euler -p isaaclab3fd fetch fault_detector/results   # -> results/euler/isaaclab3fd/fault_detector/results
+euler -p isaaclab3priority fetch fault_detector/results   # -> results/euler/isaaclab3priority/fault_detector/results
 ```
 
 - `collect.py`: `--num_episodes`, `--output_dir`, injector overrides `--p_fault`, `--fault_types a=x b=y`,
@@ -63,7 +63,7 @@ On a machine with a display (it needs a Kit window), from the Isaac Lab root:
 
 ```bash
 # once: the CJ run and the policy (the defaults below look in results/euler/... of the workspace)
-euler -p isaaclab3fd fetch fault_detector/results/tmp_explore/phase1/CJ_s0
+euler -p isaaclab3priority fetch fault_detector/results/tmp_explore/phase1/CJ_s0
 euler fetch rsl_rl/a2_study_robust_teacher/2026-10-23_11-54-58_a2_robust_teacher_s0
 ./isaaclab.sh -p scripts/forge/fault_detector/demo.py
 ```
@@ -88,7 +88,7 @@ euler fetch rsl_rl/a2_study_robust_teacher/2026-10-23_11-54-58_a2_robust_teacher
 options pass through.
 
 Recording on Euler (no Kit there: frames come from the headless capture visualizer, as in `fault_analysis/render.py`;
-the CJ run must be in the profile's `logs/`, copied there from `isaaclab3fd` for `isaaclab3`):
+the CJ run must be in the profile's `logs/`, copied there from `isaaclab3priority` for `isaaclab3`):
 
 ```bash
 euler -p isaaclab3 enqueue fd_demo_render -- python scripts/forge/fault_detector/demo.py \
@@ -156,8 +156,8 @@ Choices the spec leaves open or that the setup forces, taken in the spirit of th
 
 ## Results (2026-10-25, `results/v1`, `v1_h10`, `v1_h25`)
 
-Full tables and figures: `euler -p isaaclab3fd fetch fault_detector/results` →
-`results/euler/isaaclab3fd/fault_detector/results/v1*/report.md` and `figures/`. Mean ± std over 3 seeds;
+Full tables and figures: `euler -p isaaclab3priority fetch fault_detector/results` →
+`results/euler/isaaclab3priority/fault_detector/results/v1*/report.md` and `figures/`. Mean ± std over 3 seeds;
 closed loop on `test_id` (2162 episodes, 4446 faulty), noise on, $\tau = 0.5$, $k = 2$; 1 step = 20 ms.
 
 ### Data and injector checks (`experiment.py sanity`, `main`)

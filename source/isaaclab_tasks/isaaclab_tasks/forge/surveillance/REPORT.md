@@ -129,6 +129,17 @@ several events on one map: `crust_collapse`'s sand-with-crusts template (30 % cr
 (`MIXED_ICE` = 0.15, no random single-foot slips) on the hardpan between them. Its trigger is `any_event`; the
 event of a window is the logged flag at the trigger frame (`classify.py:mixed_event`).
 
+### 3.7 `-Faults` and `-FaultsMild` variants
+
+`IsaacContrib-Surveillance-<Type>-<Policy>[-Hard]-Faults` adds `forge/fault_injector`'s motor fault (power out or
+power loss h ∈ [0.1, 0.6], 40 % of the episodes) and the foot-stuck injector (40 %, its own seed
+`FOOT_STUCK_SEED`: with the env seed both injectors draw the same numbers and always fire together), onset 3–12 s
+after the reset. `-FaultsMild` has only a mild power loss (h ∈ [0.6, 0.85], 70 %), no stuck feet. The trigger is
+`mdp.fault_or_event` (a fault onset, a stuck foot, any terrain event, or the random nominal time). The injectors run
+the actuators in Isaac Lab, so the energy policy's `pd_gains` randomization (Newton actuators only) is dropped and its
+motor-strength observation reads the nominal 1 (`mdp.nominal_motor_strength`). Used by
+`results/reports/clustering/20261102_mechanism_detection` (collections `faults_v1`, `faults_mild`).
+
 ## 4. Deviations
 
 Values the request does not fix:
@@ -321,6 +332,11 @@ the proprioception does not tell how the robot will fall; v1's higher numbers (0
 `upright_hit` gravel falls.
 
 ## 6. Changelog
+
+- 2026-11-02: `-Faults` / `-FaultsMild` variants (§3.7), trigger `fault_or_event`, `campaign.py --faults`; GPU smoke
+  (`smoke_faults`, both policies) and collections `faults_v1`, `faults_mild`. Ruff check / format clean; the
+  2-iteration train check of AGENT.md not run (play-only tasks). Reason: the user's mechanism-detection request (faults as failure
+  classes with a known cause and onset).
 
 - 2026-10-31 (evening): GPU smoke of the Hard tasks; sand stiffness 200–800 → 60–240 N/m (§3.5). Campaign
   `v3_hard` (§5.4). Reason: the user's request (verify on the GPU).
