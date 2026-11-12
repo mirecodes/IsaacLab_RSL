@@ -50,6 +50,13 @@ def default_terrains() -> dict:
         "slip_slope": RoughSlopeCfg(
             zone="slip", difficulty_range=None, slope_deg=(10.0, 30.0), amplitude=(0.0, 0.03), fold_amplitude=(0.0, 0.0)
         ),
+        # random foot slips (one stance each) on generic uneven ground: rough_field's template on the slip zone
+        "slip_field": RoughFieldCfg(zone="slip"),
+        # a checkerboard of icy cells on gentle ground: rough_field's easiest end at every difficulty, so that the
+        # difficulty sets only the friction of the ice (``SlipCfg.ice_field_mu``)
+        "ice_field": RoughFieldCfg(
+            zone="ice", unit_size=(0.1, 0.1), amplitude=(0.02, 0.02), fold_size=(8.0, 8.0), fold_amplitude=(0.1, 0.1)
+        ),
         # sinking, lift-off failure, whole-body sinkage
         "sand_field": SandFieldCfg(),
         # support tilting under the foot (loose, mostly flat stones), kicked stones
@@ -70,10 +77,10 @@ class SlipCfg:
     """Low-friction range at difficulty 0."""
     mu_slip_hard: tuple[float, float] = (0.03, 0.25)
     """Low-friction range at difficulty 1 (bounds interpolated in between)."""
-    slip_prob: float = 0.02
-    """Probability that a touchdown (or a foot entering the map) gets a low-friction sample: about one slip per robot
-    every 6 s at 2 touchdowns per foot and second. Was 0.75 once per foot and episode (spec 0.5), tuned for the T3
-    slide ratio; the user asked for rare random slips instead (2026-10-26)."""
+    slip_prob: float = 0.25
+    """Probability that a touchdown (or a foot entering the map) gets a low-friction sample: about two slips per robot
+    and second at 2 touchdowns per foot and second. The user's request (2026-11-09); before, 0.02 (2026-10-26: v2
+    gave no falls on the slip terrains with it) and 0.75 once per foot and episode (spec 0.5)."""
     resample_on_touchdown: bool = True
     """Re-draw at every touchdown; False draws once per entry (in practice once per foot and episode)."""
     observe_slip: bool = False
@@ -86,6 +93,9 @@ class SlipCfg:
     """Side [m] of the ice cells, a square grid from the map corner."""
     ice_mu: tuple[float, float] = (0.05, 0.15)
     """Friction of an ice cell, uniform per cell."""
+    ice_field_mu: tuple[float, float] = (0.30, 0.05)
+    """Friction of ``ice_field``'s checkerboard cells at difficulty 0 and 1, the same for every icy cell of a tile
+    (chosen here, around ``ice_mu``, not tuned): 0.20 / 0.1625 / 0.125 / 0.0875 / 0.05 on the default rows."""
     ground_mu: float = 0.02
     """Friction of the terrain itself. MuJoCo-Warp uses ``max(mu_foot, mu_ground)``, so it must stay below the
     slip range for the foot value to decide the contact friction."""

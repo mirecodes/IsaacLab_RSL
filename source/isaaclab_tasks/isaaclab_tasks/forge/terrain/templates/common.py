@@ -36,7 +36,7 @@ from isaaclab.terrains.height_field.hf_terrains_cfg import HfTerrainBaseCfg
 from isaaclab.terrains.height_field.utils import convert_height_field_to_mesh, to_discrete_units
 from isaaclab.utils import configclass
 
-ZONES = ("rigid", "slip", "sand")
+ZONES = ("rigid", "slip", "sand", "ice")
 """Runtime interaction of a terrain type (:attr:`TerrainTemplateCfg.zone`); the zone id is the index."""
 
 Range = tuple[float, float]

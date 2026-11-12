@@ -32,9 +32,10 @@ Each job plays `IsaacContrib-Surveillance-<Type>-{Robust,Energy}` (`forge/survei
 inclines 0, 11.25, 22.5°), 20 robots that start every episode on a random tile, forward-only commands with smooth
 turns of at most ±45° (robust policy; the energy policy has no command input). On the inclines (`rough_slope`,
 `rough_stairs`, `slip_slope`) the robots face straight up or down the slope (±15°) and get no turn command. The
-terrain types are `forge/terrain`'s 9 plus `slip_field`, which is rough_field with random foot slips. On slip
-terrain the foot friction is drawn at every touchdown (`forge/terrain` default): low with 2 %, back to 0.8 at the
-next touchdown (see `forge/surveillance/REPORT.md` §3.4). It stops at
+terrain types are `forge/terrain`'s 11 plus `mixed_field`. On slip terrain (`slip_slope`, `slip_field`) the foot
+friction is drawn at every touchdown (`forge/terrain` default): low with 25 %, back to 0.8 at the next touchdown
+unless drawn low again; `ice_field` has a checkerboard of icy cells instead (see `forge/surveillance/REPORT.md` §3.4).
+It stops at
 100 falls or 10 min of sim time.
 
 Besides the falls, it saves up to 100 **event-trigger windows** into `triggers/`, to check that the terrain events
@@ -47,7 +48,7 @@ fire. They are 5 s, like the falls, centered on the trigger (2.5 s before, 2.5 s
 | `crust_collapse` | `crust_collapse` | the crust patch under a foot collapses |
 | `sand_field` | `sand_sink` | a foot sinks into soft sand (below the patch surface, the terrain's drag rule) |
 | `gravel_field` | `stone_step` | a loaded foot (> 1 N) stands on a stone: within its circle bound and 2 cm above the ground |
-| `slip_slope`, `slip_field` | `foot_slip` | a foot that touched down with a low friction (2 % of the touchdowns) is loaded |
+| `slip_slope`, `slip_field`, `ice_field` | `foot_slip` | a foot that touched down with a low friction (25 % of the touchdowns, or an icy cell) is loaded |
 | the others | `random_walk` | at random (once per 5 s per robot on average): normal walking, no event |
 
 A trigger window starts on the trigger's rising edge, at most one per robot per 5 s, and only when the robot has
@@ -292,6 +293,25 @@ Frame `t` is sampled at the end of env step `t`, before any reset. It holds the 
 
 Only the trigger (base contact; with `--contact_onsets` also non-foot contact onsets) runs online. The rules A–E are labels: `analyze.py` gives each a per-frame mask over the saved window, and they never decide what is recorded. A rule is either *fixed* (a physical threshold, `FIXED` in `analyze.py`) or *spike* (a signal past the `--percentile` of normal walking, `SPIKES`). Foot contact is the contact sensor's own state (`contact_time > 0`); a touchdown is the first contact frame after air time.
 
+### Rule types
+
+The letter of a rule names what it watches. The code does not define the letters in words; this reading follows from
+the rules in each group.
+
+| Type | Watches | Question it answers | Rules |
+| --- | --- | --- | --- |
+| A | body contact and posture | Is the body touching something, or in a failed posture? | `A_base_contact`, `A_leg_contact`, `A_tilt`, `A_low_base` |
+| B | whole-body dynamics and the controller's reaction | Is the motion, the critic or the action unusually abrupt, or the support about to be lost? | `B_ang_rate`, `B_gravity_rate`, `B_impact`, `B_support`, `B_value_drop`, `B_action_jump` |
+| C | feet and step timing | Is a single step going wrong? | `C_trip`, `C_slip`, `C_late_touchdown`, `C_early_touchdown`, `C_flight`, `C_sinking`, `C_wedge` |
+| D | task performance | Is the robot failing to do what it is commanded? | `D_tracking`, `D_heading`, `D_no_progress` |
+| E | joints and actuators | Is a joint or motor at its limit or working unusually hard? | `E_torque_saturation`, `E_joint_limit`, `E_pd_error`, `E_power` |
+
+A rule is a label on a frame, not a failure: a spike rule fires on about 0.1 % of normal frames by construction.
+
+### Rules
+
+The exact formula of every rule is under [Implementation](#implementation).
+
 | Rule | Kind | Hit when |
 | --- | --- | --- |
 | `A_base_contact` | fixed | base normal force > `contact_threshold` (1 N) |
@@ -338,6 +358,152 @@ Results on `2026-10-24_rough_terminal` (300 failures), with thresholds from `smo
 
 The 89 % ceiling is the 267 failures more than 1 s after a spawn: frames inside the spawn grace are never flagged. `A_base_contact`, `A_low_base`, and `D_heading` never hit: these robots tip over (tilt > 1 rad) before the base touches or drops. On `smoke/rough2` itself, the last-second and first-second rates match for every rule except `A_leg_contact` (its trigger), so the rules do not fire just because an event was recorded.
 
+### Implementation
+
+The formulas `analyze.py` and `taxonomy.py` compute, per frame $t$.
+
+**Spike threshold** of a signal $x_s$, per policy $\pi$, over the baseline frames $\mathcal D^\pi$ of normal walking,
+with $p$ = `--percentile` (99.9 in `taxonomy.py`): $\theta_s = P_p(x_s \mid \mathcal D^\pi)$ for the high tail and
+$\theta_s = P_{100-p}(x_s \mid \mathcal D^\pi)$ for the low tail. The values are written to `thresholds.json`.
+
+**Notation.** $s_i(t)$: foot $i$ in stance. $\tau^{air}_i$: air time. $\mathrm{TD}_i(t) = s_i(t) \land \tau^{air}_i(t-1) > 0$:
+touchdown. $z^{TD}_i$: foot height at its last touchdown. $v_i$: foot velocity. $F^n_b$: contact normal force on body
+$b$. $F_i$: net contact force on foot $i$. $f_c$: `contact_threshold` (1 N). $L$: the hip, thigh and calf bodies. $\bar g$:
+gravity direction in the base frame ($\bar g_z = -1$ upright). $h$: base height above the terrain under it. $V$: critic
+value. $u$: policy action. $\varphi_i$: CPG phase divided by $\pi$ (swing is $[0, 1]$). $\mathrm{held}_T[x](t)$: $x$ has
+been true for the last $T$ seconds, including $t$. $N(t)$: a touchdown within ±1 frame of $t$. $\Delta t$: the policy
+step.
+
+#### Rules A–E
+
+| Type | Rule | Kind | True at $t$ when | Threshold |
+| --- | --- | --- | --- | --- |
+| A | `A_base_contact` | fixed | $\lVert F^n_{base}(t)\rVert > f_c$ | 1 N |
+| A | `A_leg_contact` | fixed | $\exists b \in L:\ \lVert F^n_b(t)\rVert > f_c$ | 1 N |
+| A | `A_tilt` | fixed | $\bar g_z(t) > -\cos 50°$ | 50° |
+| A | `A_low_base` | fixed | $h(t) < 0.5 \cdot \mathrm{median}_{\mathcal D^\pi}(h)$ | 0.5 × baseline median |
+| B | `B_ang_rate` | spike | $\lVert\omega_b(t)\rVert > \theta$ | $\theta$ |
+| B | `B_gravity_rate` | spike | $\lVert\bar g(t) - \bar g(t-1)\rVert / \Delta t > \theta$ | $\theta$ |
+| B | `B_impact` | spike | $\lVert a(t)\rVert > \theta_{td}$ if $N(t)$, else $\lVert a(t)\rVert > \theta_{free}$ | $\theta_{td}$, $\theta_{free}$ |
+| B | `B_support` | spike, low | $\mathrm{held}_{0.1\,s}[m(t) < \theta](t)$, with $m$ the signed distance of the capture point $x + v/\omega_0$ to the stance-feet hull (one or two feet: minus the distance to the point or segment) | $\theta$ |
+| B | `B_value_drop` | spike, low | $V(t) - V(t - 0.5\,\mathrm{s}) < \theta$ | $\theta$ |
+| B | `B_action_jump` | spike | $\lVert u(t) - u(t-1)\rVert > \theta$ | $\theta$ |
+| C | `C_trip` | spike | $\max_{i:\,\mathrm{TD}_i(t)} \lVert F_{xy,i}(t)\rVert > \theta$ | $\theta$ |
+| C | `C_slip` | spike | $\max_{i:\,s_i(t)} \lVert v_{xy,i}(t)\rVert > \theta$ | $\theta$ |
+| C | `C_late_touchdown` | spike | $\exists i:\ \mathrm{TD}_i(t) \land \tau^{air}_i(t-1) > \theta$ | $\theta$ |
+| C | `C_early_touchdown` | spike, low | $\min_{i:\,\mathrm{TD}_i(t)} \varphi_i(t) < \theta$; without a CPG, $\min_{i:\,\mathrm{TD}_i(t)} \tau^{air}_i(t-1) < \theta$ | $\theta$ |
+| C | `C_flight` | spike | $\big(\forall i:\ \lnot s_i(t)\big) \land \min_i \tau^{air}_i(t) > \theta$ | $\theta$ |
+| C | `C_sinking` | fixed | $\exists i:\ s_i(t) \land z^{TD}_i(t) - z_i(t) > 0.02$ | 2 cm |
+| C | `C_wedge` | fixed | $\exists i:\ \mathrm{held}_{0.1\,s}\big[s_i \land 0.25 < \varphi_i < 0.75 \land \lVert v_i\rVert < 0.05\big](t)$; CPG policies only | 0.05 m/s, 0.1 s |
+| D | `D_tracking` | fixed | $\mathrm{held}_{1\,s}\big[\lVert v^{cmd}_{xy} - v_{xy}\rVert > 0.5\big](t)$ | 0.5 m/s, 1 s |
+| D | `D_heading` | fixed | $\mathrm{held}_{1\,s}\big[\lvert\omega^{cmd} - \omega_z\rvert > 0.5\big](t)$ | 0.5 rad/s, 1 s |
+| D | `D_no_progress` | fixed | $C(t) \ge 0.5 \land \lVert p_{xy}(t) - p_{xy}(t - 2\,\mathrm{s})\rVert < 0.25\,C(t)$, with $C(t)$ the commanded distance over the last 2 s | 0.5 m, 25 %, 2 s |
+| E | `E_torque_saturation` | fixed | $\exists j:\ \mathrm{held}_{0.1\,s}\big[\lvert\tau^{comp}_j - \tau_j\rvert > 0.01\,\tau^{lim}_j\big](t)$ | 1 %, 0.1 s |
+| E | `E_joint_limit` | fixed + spike, low | $\exists j:\ x_j(t) < \theta_j \land x_j(t) < 0.05$, with $x_j = \min(q_j - q^{lo}_j,\ q^{hi}_j - q_j) / (q^{hi}_j - q^{lo}_j)$ | $\theta_j$ per joint, 5 % |
+| E | `E_pd_error` | spike | $\exists j:\ \lvert q^{des}_j(t) - q_j(t)\rvert > \theta_j$ | $\theta_j$ per joint |
+| E | `E_power` | spike | $\sum_j \lvert\tau_j(t)\,\dot q_j(t)\rvert > \theta$ | $\theta$ |
+
+#### Privileged labels of `taxonomy.py`
+
+Per-frame labels from state a real robot does not measure (`taxonomy.privileged`), with fixed thresholds.
+$p^{TD}_{xy,i}$ is the foot's planar position at its last touchdown.
+
+| Label | True at $t$ when | Threshold |
+| --- | --- | --- |
+| `slip_2feet` | $\sum_i \big[s_i(t) \land \lVert v_{xy,i}(t)\rVert > 0.3\big] \ge 2$ | 0.3 m/s |
+| `sink_5cm` | $\exists i:\ s_i(t) \land z^{TD}_i(t) - z_i(t) > 0.05 \land \lVert p_{xy,i}(t) - p^{TD}_{xy,i}(t)\rVert < 0.05$ | 5 cm |
+| `front_leg_contact` | $\exists b \in L_{FL,FR}:\ \lVert F^n_b(t)\rVert > f_c$ | 1 N |
+| `hind_leg_contact` | $\exists b \in L_{RL,RR}:\ \lVert F^n_b(t)\rVert > f_c$ | 1 N |
+| `thigh_contact` | $\exists b \in L_{hip,thigh}:\ \lVert F^n_b(t)\rVert > f_c$ | 1 N |
+| `stance_1foot` | $\sum_i s_i(t) \le 1 \land h(t) < 0.3$ | 0.3 m |
+
+#### Terrain-event flags
+
+Simulator state per foot, logged since 2026-10-31. The taxonomy label is true when any foot's flag is true. There is no
+numeric threshold on the flag itself. $\sigma_i$: the foot is over the slip terrain or the ice grid.
+$\mathrm{enter}_i(t) = \sigma_i(t) \land (\lnot\sigma_i(t-1) \lor \mathrm{TD}_i(t))$;
+$\mathrm{leave}_i(t) = \lnot\sigma_i(t) \land \sigma_i(t-1)$; $\xi_i \sim U(0, 1)$.
+
+| Label | Per-foot flag |
+| --- | --- |
+| `terrain_low_mu` | on $\mathrm{enter}_i$: $(\xi_i < p_{slip}) \lor \mathrm{icy}_i$; on $\mathrm{leave}_i$: false; else held |
+| `terrain_on_ice` | on $\mathrm{enter}_i$: $\mathrm{icy}_i$; on $\mathrm{leave}_i$: false; else held |
+| `terrain_in_sand` | the foot is over ordinary sand or a collapsed crust, and $z_i(t) < z_{surface}(t) + r_{foot}$ |
+| `terrain_collapse` | true only on the step the crust patch under the foot collapses |
+
+`terrain_low_mu` and `terrain_on_ice` are latched at touchdown and held through the swing, so they mean "the last
+touchdown was on a low-friction spot", not "this foot is on ice now".
+
+#### Physical state of `sequences.py` (z-state)
+
+The continuous per-frame description used by `first_violation`, `dtw`, `ae` and as the target of `priv_latent`
+(`sequences.STATE`, `physical_state`). $\bar g$ is the gravity direction and $\omega$ the angular velocity in the base
+frame, $v^b$ the base velocity in the base frame. Left and right are merged: absolute values for the sideways
+channels, and legs grouped as front / hind only. All channels are privileged sim state.
+
+| # | Channel | Group (`GROUPS`) | Value at frame $t$ |
+| --- | --- | --- | --- |
+| 1 | `roll` | attitude | $\lvert\mathrm{atan2}(\bar g_y, -\bar g_z)\rvert$ |
+| 2 | `pitch` | attitude | $\mathrm{atan2}(\bar g_x, -\bar g_z)$ |
+| 3 | `roll_rate` | attitude | $\lvert\omega_x\rvert$ |
+| 4 | `pitch_rate` | attitude | $\omega_y$ |
+| 5 | `yaw_rate` | attitude | $\lvert\omega_z\rvert$ |
+| 6 | `base_height` | body_drop | $h(t)$ |
+| 7 | `vx_error` | tracking | $v^b_x - v^{cmd}_x$ |
+| 8 | `vy_error` | tracking | $\lvert v^b_y - v^{cmd}_y\rvert$ |
+| 9 | `vz` | body_drop | world vertical velocity of the base |
+| 10 | `support_margin` | support | $\mathrm{clip}(m(t), -0.3, 0.3)$ with $m$ of `B_support`; $-0.3$ with no foot down |
+| 11 | `feet_down` | support | $\sum_i s_i(t)$ |
+| 12 | `slip_front` | slip | $\max_{i \in \text{front}} s_i(t)\,\lVert v_{xy,i}(t)\rVert$ |
+| 13 | `slip_hind` | slip | $\max_{i \in \text{hind}} s_i(t)\,\lVert v_{xy,i}(t)\rVert$ |
+| 14 | `sink_front` | sink | $\max_{i \in \text{front}}$ of $\max(z^{TD}_i - z_i,\ 0)$, counted while the foot is in stance and within 5 cm of its touchdown point |
+| 15 | `sink_hind` | sink | the same over the hind feet |
+| 16 | `leg_force_front` | leg_contact | $\log\big(1 + \sum_{b \in L_{FL,FR}} \lVert F^n_b(t)\rVert\big)$ |
+| 17 | `leg_force_hind` | leg_contact | $\log\big(1 + \sum_{b \in L_{RL,RR}} \lVert F^n_b(t)\rVert\big)$ |
+| 18 | `torque_ratio` | torque | $\max_j \lvert\tau_j(t)\rvert / \tau^{lim}_j$ |
+
+From the raw channels to the sequences the methods use:
+
+1. **Cut** (`cut`): the frames $[t_b - 1.5\,\mathrm{s},\ t_b + 0.5\,\mathrm{s})$, 100 frames, edge-padded past the window.
+2. **Standardize** (`standardize`), per policy $\pi$ and channel $c$: $z_c = (x_c - \mathrm{median}_{\mathcal N^\pi}\,x_c) / \max(\mathrm{std}_{\mathcal N^\pi}\,x_c,\ 10^{-3})$.
+   $\mathcal N^\pi$ is every frame of the policy's `random_walk` trigger windows given by `--normal`, without the windows in
+   which the base touches.
+3. **Per method:** `dtw` and `ae` use the compressed $\mathrm{sign}(z)\log(1 + \lvert z\rvert)$, and `ae` then clips to ±10.
+   The `priv_latent` targets and the mechanism $R^2$ clip $z$ to ±10. `first_violation` uses $z$ as it is.
+
+Example from the fall below (Robust, normal walking of `v3_hard`, 455 windows or 113,750 frames):
+
+| Frame ($t - t_b$) | Channel | Raw | Median | Std | $z$ | Compressed |
+| --- | --- | --- | --- | --- | --- | --- |
+| 142 (−0.96 s) | `slip_front` | 1.302 m/s | 0.005 | 0.158 | 8.21 | 2.22 |
+| 142 (−0.96 s) | `slip_hind` | 0.021 m/s | 0.031 | 0.138 | −0.08 | −0.08 |
+| 197 (+0.14 s) | `roll` | 0.913 rad | 0.081 | 0.114 | 7.27 | 2.11 |
+| 197 (+0.14 s) | `base_height` | 0.225 m | 0.360 | 0.031 | −4.32 | −1.67 |
+
+The front stance foot slides 8.21 normal standard deviations above this policy's normal walking. The cut of this
+fall is frames 115–214.
+
+### Worked example
+
+One real fall: `v3_hard/Robust/slip_field/events/000003.npz`, 250 frames at 50 Hz. Its balance loss is frame 190, the
+reference $t_b$ of `taxonomy.py`. The spike thresholds are the Robust values of the `taxonomy_v3` run (the policy's
+values for every rule: `results/reports/surveillance/20261031_hard_terrain/LABELS.md`).
+
+| Type | Rule | Frame ($t - t_b$) | Values | Why it is true there |
+| --- | --- | --- | --- | --- |
+| A | `A_tilt` | 197 (+0.14 s) | $\bar g_z = -0.588$; the frame before, $-0.664$ | $-0.588 > -\cos 50° = -0.643$ |
+| B | `B_ang_rate` | 152 (−0.76 s) | $\lVert\omega_b\rVert = 1.233$ rad/s; the frame before, 0.678 | $1.233 > \theta = 1.157$ |
+| C | `C_slip` | 142 (−0.96 s) | stance feet FL 1.302 and RR 0.021 m/s; FR 1.616 and RL 2.088 m/s are in swing, so they do not count | $\max(1.302, 0.021) = 1.302 > \theta = 1.221$ |
+| D | `D_tracking` | 240 (+1.00 s) | velocity error at least 0.724 m/s on frames 191–240; 0.428 m/s on frame 190 | frame 240 is the first with 1 s (50 frames) above 0.5 m/s |
+| E | `E_pd_error` | 12 (−3.56 s) | FL thigh $\lvert q^{des} - q\rvert = 0.565$ rad | $0.565 > \theta_{FL\,thigh} = 0.551$ |
+| privileged | `slip_2feet` | 146 (−0.88 s) | all four feet in stance, speeds 0.910, 0.585, 0.562 and 0.041 m/s | three stance feet above 0.3 m/s, and $3 \ge 2$ |
+| terrain | `terrain_on_ice` | 190 (0 s) | all four feet in the air, with an applied friction of 0.055 on each | latched at each foot's last touchdown on ice |
+
+A label becomes a feature as the share of its frames in a 0.5 s bin. `C_slip` is true on 10 of the 25 frames of
+$[t_b - 0.5\,\mathrm{s},\ t_b)$, so `C_slip@-0.5` = 0.40. Over the four bins `@-1.5`, `@-1.0`, `@-0.5` and `@+0.0`, `A_tilt` is
+0, 0, 0 and 0.72, and `terrain_on_ice` is 0.12, 1, 1 and 1. A firing rule alone is not a failure: in this window
+`E_pd_error` first fires 3.56 s before the balance loss.
+
 ## Decisions
 
 Choices the request left open, and how they were made here:
@@ -367,6 +533,10 @@ Choices the request left open, and how they were made here:
 
 ## Changelog
 
+- 2026-11-09: "Rule flags" gives the meaning of the types A–E, an "Implementation" part with the formula of every rule
+  and the privileged and terrain labels of `taxonomy.py`, the physical state of `sequences.py` (z-state), and a worked
+  example from a real fall. Documentation only.
+  Reason: the user's request.
 - 2026-11-01 (afternoon): `counterfactual.py` adds the reactions `back`, `stand`, `crouch`, `wide` and `pause`, works
   for the Energy policy (last actions restored), takes `--num_envs`, and records `tilt_max_deg`, `tilt_end_deg`,
   `leg_contact` and `travel_m`. `sequences.py` adds `ae_inv`, an autoencoder made invariant to the policy. New

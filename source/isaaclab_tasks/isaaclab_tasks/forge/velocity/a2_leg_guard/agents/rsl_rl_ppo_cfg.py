@@ -19,3 +19,15 @@ class A2LegGuardPPORunnerCfg(A2RobustTeacherPPORunnerCfg):
         self.experiment_name = "a2_leg_guard"
         # as a2_fault_aware: about 40 min on one RTX 4090
         self.max_iterations = 1000
+
+
+@configclass
+class A2LegGuardStandPPORunnerCfg(A2RobustTeacherPPORunnerCfg):
+    """The teacher's network and PPO settings, trained from scratch (new action space)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "a2_leg_guard_stand"
+        # chosen here: standing is easier than the teacher's walking (3000)
+        self.max_iterations = 1500

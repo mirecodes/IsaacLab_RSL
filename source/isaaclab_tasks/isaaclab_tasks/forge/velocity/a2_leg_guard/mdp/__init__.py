@@ -5,4 +5,11 @@
 
 """This task's terms: the leg flag, its reward and the tuck action."""
 
-from .leg_flag import GuardCPGAction, GuardCPGActionCfg, external_leg_flag, flagged_foot_load, leg_flag  # noqa: F401
+from .leg_flag import (  # noqa: F401
+    GuardCPGAction,
+    GuardCPGActionCfg,
+    external_leg_flag,
+    flagged_foot_contact,
+    flagged_foot_load,
+    leg_flag,
+)

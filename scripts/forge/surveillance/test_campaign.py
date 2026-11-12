@@ -29,8 +29,8 @@ def test_summarize():
 
 
 def test_terrains():
-    names = {"rough_field", "slip_field", "mixed_field"}
-    assert names <= set(terrains()) and len(terrains()) == len(set(terrains())) == 11
+    names = {"rough_field", "slip_field", "ice_field", "mixed_field"}
+    assert names <= set(terrains()) and len(terrains()) == len(set(terrains())) == 12
 
 
 if __name__ == "__main__":

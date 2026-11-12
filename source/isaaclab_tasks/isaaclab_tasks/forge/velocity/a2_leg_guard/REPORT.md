@@ -1,6 +1,6 @@
 # A2 leg guard
 
-**Gym IDs:** `IsaacContrib-Velocity-A2LegGuard-{Soft,Tuck}`
+**Gym IDs:** `IsaacContrib-Velocity-A2LegGuard-{Soft,Tuck,Stand}`
 **Base:** `velocity/a2_velocity` `A2RobustTeacherEnvCfg` (env), `A2RobustTeacherPPORunnerCfg` (runner) ·
 **Copied from:** the fault setup of `velocity/a2_fault_aware` · **Sources:** the argument of 2026-11-07 (per-leg signal instead of a failure taxonomy); Miki et al. 2022 for the base.
 
@@ -9,6 +9,9 @@
 The robust teacher's task with motor faults and stuck feet and a 4-d leg flag in its input. While a leg is flagged,
 the policy must stop relying on it: `-Soft` pays for the load on the flagged foot and finds its own way to unload it,
 `-Tuck` has the action term pull the foot back, so the policy only has to balance on the other three.
+
+`-Stand` (§3.6) is a separate standing policy, trained from scratch: no walking, no faults; while a leg is flagged it
+must hold that foot off the ground and balance on the other three.
 
 ## 2. Architecture
 
@@ -71,6 +74,25 @@ As `a2_fault_aware`: `motor_fault` ($p = 0.4$, one joint, power out or loss $h \
 From `a2_fault_aware` Blind `model_3998.pt`: `pad_checkpoint.py --drop 12 --extra 4` removes the 12 zero mode columns
 and adds 4 zero flag columns, so the fine-tune starts from Blind's behavior; 1000 iterations.
 
+### 3.6 `-Stand`
+
+Differs from the robust teacher as follows (the Soft/Tuck terms above do not apply):
+
+| Part | Setting |
+|---|---|
+| Command | $v^{cmd} = 0$, $\omega^{cmd} = 0$ (the tracking terms reward standing still) |
+| Action (12) | $q^{\ast} = q_0 + 0.25\,a$, joint position, no CPG |
+| Observation (334) | teacher input without `cpg_phase` (13), `joint_target` (24), `joint_pos_error` (36) (CPG-only attributes), plus `last_action` (12) and `leg_flag` (4) |
+| Smoothness | `target_smoothness` → $-0.005 \sum (a_t - a_{t-1})^2$ (the A2 base task's action rate), same name so the curriculum scales it |
+| Flag | in 80 % of episodes one random leg, on at $U[0.5, 8]$ s for $U[3, 15]$ s (past the 20 s episode = to the end); no injectors |
+| Reward | $r_{touch} = -1.5 \sum_l f_l\, \mathbb{1}[F_{z,l} > 5\,\mathrm{N}]\,(1 + \min(F_{z,l}/F_0, 2))$; $r_{term} = -200$ per fall (×0.02 s) |
+| Terrain | teacher terrain, no level curriculum; robots stay at initial levels 0–5 |
+| Training | from scratch, 1500 iterations |
+
+$r_{touch}$ costs 1.5–4.5 per second, about what the three tracking terms pay at best (3 × 1.5); $r_{term}$ makes a
+fall cost more than a touch, so the policy cannot escape the penalty by falling. A foot that hovers just above the ground
+pays nothing; there is no lift-height reward.
+
 ## 4. Deviations
 
 * The flag's distribution is chosen here, not measured on the final detector (the policy's gait changes the detector's
@@ -87,3 +109,5 @@ lowers falls against the same policy without a flag.
 ## 6. Changelog
 
 2026-11-07: task created.
+2026-11-07: `-Stand` added (§3.6); `leg_flag` works without injectors. Reason: the user needs a policy that balances
+without the flagged leg, with a discrete contact penalty, instead of walking on it.

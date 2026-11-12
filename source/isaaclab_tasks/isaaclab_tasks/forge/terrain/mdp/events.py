@@ -6,8 +6,8 @@
 """The terrain's runtime physics, as one event term run every policy step.
 
 Newton (MuJoCo-Warp) only: shape properties are written into the Newton model, see ``REPORT.md`` for how each
-interaction maps onto MuJoCo's contact model. Only the parts the terrain type needs run: slip on ``slip`` terrain,
-sand drag where there are sand patches, collapse where there are crusts, stone upkeep where there are stones.
+interaction maps onto MuJoCo's contact model. Only the parts the terrain type needs run: slip on ``slip`` and ``ice``
+terrain, sand drag where there are sand patches, collapse where there are crusts, stone upkeep where there are stones.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from .generator import TerrainMap
 
 SLIP = ZONES.index("slip")
+ICE = ZONES.index("ice")
 EVENT = "terrain"
 """Name of the event term in the env cfg (the policy's privileged friction input reads :attr:`foot_friction`)."""
 
@@ -144,6 +145,10 @@ class terrain_step(ManagerTermBase):
         icy = torch.rand(cells, generator=rng) < world.slip.ice_frac
         mu_ice = world.slip.ice_mu[0] + torch.rand(cells, generator=rng) * (world.slip.ice_mu[1] - world.slip.ice_mu[0])
         self._ice_mu = torch.where(icy, mu_ice, float("inf")).to(dev)
+        if self.map.zone == ICE:
+            self._ice_mu = self.map.checkerboard_friction(
+                world.slip.ice_cell, world.platform_width, world.slip.ice_field_mu
+            ).to(dev)
         self.in_sand = torch.zeros(n, f, dtype=torch.bool, device=dev)
         self.collapse_event = torch.zeros(n, f, dtype=torch.bool, device=dev)
         # crust / collapsed flags per patch, plus a trailing "no patch" entry so that patch id -1 indexes safely
@@ -190,8 +195,9 @@ class terrain_step(ManagerTermBase):
 
     def __call__(self, env: ManagerBasedEnv, env_ids, world, asset_cfg, sensor_cfg) -> None:
         pos = self.robot.data.body_link_pos_w.torch[:, self.foot_ids]
-        # slip terrain, or ice patches on any terrain (where the slab of a sand patch, with priority, keeps its own mu)
-        if self.map.zone == SLIP or self.world.slip.ice_frac > 0:
+        # slip or ice terrain, or ice patches on any terrain (where the slab of a sand patch, with priority, keeps its
+        # own mu)
+        if self.map.zone in (SLIP, ICE) or self.world.slip.ice_frac > 0:
             self._slip(env, *self.map.lookup(pos[..., :2]), self._ice(pos[..., :2]))
         if self.map.patches:
             patch, surface = self.map.patch(pos[..., :2])
@@ -230,7 +236,8 @@ class terrain_step(ManagerTermBase):
         lo = interp((cfg.mu_slip_easy[0], cfg.mu_slip_hard[0]), difficulty)
         hi = interp((cfg.mu_slip_easy[1], cfg.mu_slip_hard[1]), difficulty)
         sample = lo + torch.rand_like(lo) * (hi - lo)
-        low = torch.rand_like(lo) < cfg.slip_prob
+        # ice terrain: only the cells are slippery, no random slips
+        low = torch.rand_like(lo) < (0.0 if self.map.zone == ICE else cfg.slip_prob)
         icy = torch.isfinite(ice)
         mu = torch.where(icy, ice, torch.where(low, sample, cfg.mu_nominal))
         self.foot_mu = torch.where(enter, mu, self.foot_mu)

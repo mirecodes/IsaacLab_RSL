@@ -1,7 +1,7 @@
 # Terrain templates
 
 **Gym IDs:** `IsaacContrib-Terrain-<Type>-A2{Robust,Energy}`, `<Type>` ∈ `RoughField`, `PitField`, `StubField`,
-`RoughSlope`, `RoughStairs`, `SlipSlope`, `SandField`, `GravelField`, `CrustCollapse` (18 tasks)
+`RoughSlope`, `RoughStairs`, `SlipSlope`, `SlipField`, `IceField`, `SandField`, `GravelField`, `CrustCollapse` (22 tasks)
 **Base:** `A2RobustTeacherEnvCfg`, `A2EnergyTeacherRoughEnvCfg` (`velocity/a2_velocity`), with their runner cfgs ·
 **Copied from:** `a2_velocity/mdp/events.py:randomize_foot_friction` (the Newton friction binding) ·
 **Sources:** "Harsh World 구현 명세서 — fault 관측용 지형" (2026-10-24)
@@ -104,6 +104,8 @@ outer border (5 m) continues the height of each edge pixel outward instead of si
 | `rough_slope` | `slope.py` | rigid | one-direction incline `b(x)` of `slope_deg` 0–45 deg along x through a 3 m flat landing (spawn), blended over 1 m; columns in `smooth_tiles` (0, 1) plain, the others with the fractal roughness (folds ±5–25 cm) |
 | `rough_stairs` | `stairs.py` | rigid | one-direction stairs at `slope_deg` 0–45 deg: tread `step_width` 0.35→0.25 m, riser `tread x tan θ` (0.25 m at 45 deg), up along +x and down along -x from the landing; rough columns: treads `U(0.8, 1.2)` (rescaled to the clean flight's length), step edges eroded (`edge_jitter` ≤ 8 cm), ≤ 3 cm noise |
 | `slip_slope` | `slope.py` | slip | incline of 18–30 deg (d 0.4–1.0), fine noise ≤ 3 cm on the rough columns, no folds |
+| `slip_field` | `rough_field.py` | slip | `rough_field`'s ground at the same difficulties |
+| `ice_field` | `rough_field.py` | ice | `rough_field` fixed at its easiest end at every difficulty (bumps ±2 cm of 0.1 m, folds ±0.1 m of 8 m), so the difficulty sets only the ice friction (§3.4) |
 | `sand_field` | `sand.py` | sand | rough hardpan; patchwork of patches: the tile is cut into an irregular grid (cells 1.2–4.5 m per column and row), 25–45 % of the cells hold a rectangle inset by 0.4 + U(0, 0.6) m per side; each patch flattened to its mean level `s` around the slab footprint, interior lowered by `sand_depth` keeping half the roughness, 0.1 m ramp |
 | `gravel_field` | `gravel_field.py` | rigid | `rough_field` ground with loose stones only (no static ones): 8 per robot, 10–45 cm, 80 % flat (all above 20 cm) (height 15–40 % of the length, flat top and bottom faces), width 50–90 % of the length, random hulls; resting on the bumps, they tilt when stepped on near an edge |
 | `crust_collapse` | `sand.py` | sand | `sand_field` with 40 % crust patches |
@@ -137,10 +139,10 @@ stiffness and friction (0.6). A slab is a static box from the sand surface 0.6 m
 sinking foot meets the hardpan before it could be pushed out of the box.
 
 **Slip** (zone `slip`). Per foot, at every touchdown on the tile grid (`resample_on_touchdown`) and on entering
-it: with probability `slip_prob` = 0.02, `μ ~ U(lo(d), hi(d))` with `[lo, hi]` interpolated from (0.05, 0.35) at
-d = 0 to (0.03, 0.25) at d = 1, else `μ_nominal` = 0.8. A slip is thus a rare random event (about one per robot
-every 6 s) that lasts one stance; the next touchdown restores `μ_nominal` with probability 0.98. `μ_nominal` again
-on leaving the grid or on reset. With `resample_on_touchdown=False` the draw is once per entry (in practice once
+it: with probability `slip_prob` = 0.25, `μ ~ U(lo(d), hi(d))` with `[lo, hi]` interpolated from (0.05, 0.35) at
+d = 0 to (0.03, 0.25) at d = 1, else `μ_nominal` = 0.8. A slip is thus a random one-stance event (about two per robot
+and second at 2 touchdowns per foot and second); the next touchdown restores `μ_nominal` with probability 0.75.
+`μ_nominal` again on leaving the grid or on reset. With `resample_on_touchdown=False` the draw is once per entry (in practice once
 per foot and episode; the default before 2026-10-26, with `slip_prob` 0.75). Only the changed environments' foot shapes are written.
 
 **Ice patches** (`ice_frac` > 0, default 0: off). The map is cut into `ice_cell` = 2 m squares from its corner; a
@@ -149,6 +151,13 @@ an ice cell takes that cell's `μ_ice` instead of the slip draw (`low_mu` and `o
 on the patch slips together, and a robot walking onto ice loses grip on two to four feet within one gait cycle
 instead of one random foot. With ice the slip physics runs on any zone (on a sand slab the slab's own μ 0.6 wins by
 contact priority).
+
+**Ice field** (zone `ice`, `TerrainMap.checkerboard_friction`). The `ice_cell` = 2 m squares from the map corner are
+a checkerboard: square (i, j) is icy if i + j is even and it does not overlap the 3 m spawn platform of its tile. An
+icy square has `μ(d) = 0.30 - 0.25 d` (`ice_field_mu`, the tile's difficulty d, the same on all icy squares of a tile:
+0.20 / 0.1625 / 0.125 / 0.0875 / 0.05 on the default rows). A touchdown takes the friction of the square under the
+foot (`low_mu` and `on_ice` set on an icy one, `μ_nominal` otherwise) and keeps it for that stance, as for the ice
+patches. There are no random slips on this zone.
 
 **Sand** (sand patches). A foot is in the sand if it is over a soft patch footprint and `z_foot < s + r_foot`. Then
 `F_xy = -c_drag(d) v_xy`, `F_z = -c_suction(d) max(v_z, 0)` (c_drag 20–80, c_suction 30–150 N s/m), capped at 60 N,
@@ -324,6 +333,10 @@ touched the stairs and slopes at the platform edge within 1 s); dynamic rocks 15
 
 ## 6. Changelog
 
+- 2026-11-09: `slip_field` moved here from `forge/surveillance`; new type `ice_field` (zone `ice`, checkerboard of icy
+  cells, friction set by the difficulty); `slip_prob` 0.02 → 0.25. Local tests and a Mac CPU code-path smoke pass; the
+  GPU run is `results/reports/surveillance/20261109_ice_field`. Reason: the user's request (event slips and ice as
+  separate terrain types).
 - 2026-10-31: `SlipCfg.ice_frac / ice_cell / ice_mu`: ice patches (default off, so every map is unchanged); the event
   keeps `on_ice` per foot. Not yet run on the GPU (Euler unreachable that night; code path checked on the Mac CPU
   container only). Reason: the 2026-10-26 meeting (single-foot slips at 2 % never felled a robot; "define

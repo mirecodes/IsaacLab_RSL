@@ -263,6 +263,18 @@ class TerrainMap:
         difficulty = self.difficulty[rc[..., 0].clamp(min=0), rc[..., 1].clamp(min=0)]
         return inside, torch.where(inside, difficulty, 0.0)
 
+    def checkerboard_friction(self, cell: float, platform_width: float, mu: tuple[float, float]) -> torch.Tensor:
+        """Friction per ``cell`` square of the grid (from the map corner): a checkerboard of ice with
+        ``mu[0] + d (mu[1] - mu[0])`` at the difficulty d of its tile, inf on the other squares and on the squares
+        that overlap a tile's spawn platform."""
+        count = torch.ceil(self.size * torch.tensor([self.num_rows, self.num_cols]).to(self.size) / cell).long()
+        i, j = torch.meshgrid(*[torch.arange(c, device=self.device) for c in count.tolist()], indexing="ij")
+        center = self.corner + cell * (torch.stack([i, j], -1) + 0.5)
+        tile_center = self.corner + (self.tile(center) + 0.5) * self.size
+        off_platform = ((center - tile_center).abs() >= (platform_width + cell) / 2).any(-1)
+        icy = ((i + j) % 2 == 0) & off_platform
+        return torch.where(icy, mu[0] + self.lookup(center)[1] * (mu[1] - mu[0]), float("inf"))
+
     def patch(self, xy: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Sand patch id under each point (-1 if none) and that patch's surface height (0 if none)."""
         rc = self.tile(xy)

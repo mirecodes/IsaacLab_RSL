@@ -15,6 +15,7 @@ import sys
 
 import numpy as np
 import pytest
+import torch
 import yaml
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -23,7 +24,7 @@ from build import build, plot_map  # noqa: E402
 from isaaclab.terrains.height_field.utils import to_discrete_units  # noqa: E402
 
 from isaaclab_tasks.forge.terrain import TERRAINS, task_id  # noqa: E402
-from isaaclab_tasks.forge.terrain.mdp.generator import write_meta  # noqa: E402
+from isaaclab_tasks.forge.terrain.mdp.generator import TerrainMap, write_meta  # noqa: E402
 from isaaclab_tasks.forge.terrain.templates.common import Grid, lerp, noise  # noqa: E402
 from isaaclab_tasks.forge.terrain.templates.gravel_field import rock_mesh  # noqa: E402
 from isaaclab_tasks.forge.terrain.templates.sand import RIM  # noqa: E402
@@ -32,6 +33,22 @@ from isaaclab_tasks.forge.terrain.world_cfg import TerrainWorldCfg, default_terr
 HS, VS = 0.03, 0.005
 INCLINES = ("rough_slope", "rough_stairs", "slip_slope")
 """Templates whose edge band follows a base profile instead of z = 0 (the rows chain into one hillside)."""
+
+
+def test_stress_tiers():
+    """Every test tier of ``forge/surveillance`` names real knobs, and lands on the map it was written for."""
+    from isaaclab_tasks.forge.surveillance import STRESS_TIERS
+    from isaaclab_tasks.forge.surveillance.env_cfg import STRESS, deploy_world
+
+    assert set(STRESS) == set(STRESS_TIERS)
+    for terrain, knobs in STRESS.items():
+        tiers = STRESS_TIERS[terrain]
+        for level in range(1, tiers + 1):
+            world = deploy_world(terrain, True, level)
+            for knob, values in knobs.items():
+                section, _, name = knob.rpartition(".")
+                target = getattr(world, section) if section else world.terrains[terrain]
+                assert len(values) == tiers and getattr(target, name) == values[level - 1], (terrain, knob)
 
 
 @pytest.fixture(scope="module")
@@ -229,6 +246,26 @@ def test_rough_field_octaves():
     fine = np.abs(np.diff(h, axis=0)).mean()
     print(f"[T1] rough_field d=1: 1 m-smoothed range {np.ptp(coarse):.2f} m, mean pixel step {fine * 100:.2f} cm")
     assert np.ptp(coarse) > 6 * lerp(cfg.amplitude, 1.0) and fine > 0.002
+
+
+def test_ice_field_checkerboard():
+    """Ice on alternating 2 m squares, its friction set by the tile's difficulty, none on the spawn platforms."""
+    world, generator, meta, _ = build("ice_field", 42, tiles_per_level=2)
+    assert meta["zone"] == "ice"
+    heights, corner = generator.map_heights()
+    field = TerrainMap(meta, heights, corner, HS, "cpu")
+    cell, slip = world.slip.ice_cell, world.slip
+    mu = field.checkerboard_friction(cell, world.platform_width, slip.ice_field_mu)
+    icy = torch.isfinite(mu)
+    assert mu.shape == (60, 24)
+    assert not (icy[1:] & icy[:-1]).any() and not (icy[:, 1:] & icy[:, :-1]).any()
+    for t in meta["tiles"]:
+        i, j = t["row"] * 12, t["col"] * 12
+        tile_mu, tile_icy = mu[i : i + 12, j : j + 12], icy[i : i + 12, j : j + 12]
+        assert not tile_icy[5:7, 5:7].any()
+        assert tile_icy.sum() == 72 - 2
+        assert tile_mu[tile_icy].numpy() == pytest.approx(lerp(slip.ice_field_mu, t["difficulty"]), abs=1e-5)
+    print(f"[T1] ice_field: {icy.float().mean() * 100:.1f} % of the cells icy")
 
 
 def test_stones():

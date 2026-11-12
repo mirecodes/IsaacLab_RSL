@@ -18,6 +18,8 @@ TERRAINS = (
     "rough_slope",
     "rough_stairs",
     "slip_slope",
+    "slip_field",
+    "ice_field",
     "sand_field",
     "gravel_field",
     "crust_collapse",

@@ -67,24 +67,26 @@ terrain event term, which is one policy step old when the recorder reads it. `sc
 | `crust_collapse` | `crust_collapse` | `collapse_event`: the crust patch under one of the robot's feet collapsed in the last step |
 | `sand_field` | `sand_sink` | `in_sand`: a foot below the surface of a soft patch (ordinary sand or collapsed crust) |
 | `gravel_field` | `stone_step` | a foot with vertical force > 1 N, within half the length of one of its robot's stones (horizontally) and > 2 cm above the ground height map plus the foot radius |
-| `slip_slope`, `slip_field` | `foot_slip` | `low_mu` and vertical force > 1 N on the same foot: it touched down with a low friction (§3.4). The trigger moment is the slippery touchdown, whether or not the foot then slides |
+| `slip_slope`, `slip_field`, `ice_field` | `foot_slip` | `low_mu` and vertical force > 1 N on the same foot: it touched down with a low friction (§3.4). The trigger moment is the slippery touchdown, whether or not the foot then slides |
 | `mixed_field` | `any_event` | any of `crust_collapse`, `sand_sink`, `foot_slip` (§3.6); which one is read from the logged terrain flags |
 | the others | `random_walk` | at random, $p = \Delta t / 5$ s per step and robot: normal walking, no event |
 
 ### 3.4 Slips, `slip_field`
 
-Slips follow `forge/terrain`'s default since 2026-10-26. Each foot on slip terrain draws its friction at every
-touchdown: with probability `slip_prob` 0.02, $\mu \sim U(lo(d), hi(d))$, else $\mu_{nominal}$ 0.8. The range is
-$lo = 0.05 \to 0.03$ and $hi = 0.35 \to 0.25$ over $d = 0 \to 1$, which gives 0.042–0.31, 0.039–0.295, 0.036–0.28
-on rows 1–3. A slip lasts one stance: the next touchdown restores 0.8 with probability 0.98. At about 2 touchdowns
-per foot and second, that is roughly one slip per robot every 6 s. The ground's own $\mu$ is 0.02, and MuJoCo uses
+Slips follow `forge/terrain`'s default. Each foot on slip terrain draws its friction at every touchdown: with
+probability `slip_prob` 0.25 (0.02 from 2026-10-26 to 2026-11-09), $\mu \sim U(lo(d), hi(d))$, else $\mu_{nominal}$ 0.8.
+The range is $lo = 0.05 \to 0.03$ and $hi = 0.35 \to 0.25$ over $d = 0 \to 1$, which gives 0.042–0.31, 0.039–0.295,
+0.036–0.28 on rows 1–3. A slip lasts one stance: the next touchdown restores 0.8 with probability 0.75. At about 2
+touchdowns per foot and second, that is roughly two slips per robot and second. The ground's own $\mu$ is 0.02, and MuJoCo uses
 the larger of the two. The policy's privileged friction input still reports 0.8 (`observe_slip` False).
 `terrain_v1` (§5.1) ran with the old default: 75 % of the feet low, drawn once per episode.
 
-`slip_field` = `RoughFieldCfg(zone="slip")`, added to the world's template catalog by this task (`extra_templates`,
-registered through `EXTRA_TERRAINS`). It is rough_field's ground with the slip event, at the same difficulties (0.4,
-0.55, 0.7). Tile layouts are seeded by the terrain name, so its tiles differ from `rough_field`'s. It is not an
-incline: steering with turns, as on the other flat types.
+`slip_field` = `RoughFieldCfg(zone="slip")`, in `forge/terrain`'s catalog since 2026-11-09. It is rough_field's ground
+with the slip event, at the same difficulties (0.4, 0.55, 0.7). Tile layouts are seeded by the terrain name, so its
+tiles differ from `rough_field`'s. It is not an incline: steering with turns, as on the other flat types.
+
+`ice_field` (`forge/terrain` §3.4) has a checkerboard of icy cells instead of the random slips, on gentle rough ground;
+the difficulty sets only the friction of the ice.
 
 ### 3.5 `-Hard` variants
 
@@ -96,13 +98,14 @@ proprioception alone only the crust collapse is detectable (§5.3). The `-Hard` 
 | Knob | Plain | Hard | Why |
 | --- | --- | --- | --- |
 | Rows kept | first 3 of 5 (d 0.4 / 0.55 / 0.7) | last 3 (d 0.7 / 0.85 / 1.0; inclines 22.5 / 33.75 / 45°) | stairs, pits, slopes never felled Robust at ≤ 0.7 |
-| Ice patches (slip terrains) | none | `ice_frac` 0.15 of 2 m cells, μ 0.05–0.15 | a single random slipping foot is absorbed |
 | Sand stiffness, depth | 800–3000 N/m, 8–20 cm | 60–240 N/m, 12–25 cm | sink to the hardpan within one stance: a hidden hole under a flat-looking surface |
 | Sand suction, force cap | 30–150 N s/m, 60 N | 150–400 N s/m, 120 N | a foot held on lift-off (stuck foot) |
 | Crust collapse | `soften`, 1.5–3 × 98 N | `disable` (to the hardpan), 0.8–1.5 × 98 N | support lost under one stance foot |
 | Stub / root height | 2–6 / 2–4 cm | 4–12 / 3–8 cm | up to a swing height; still narrower than the 0.1 m scanner grid |
 
-The first values came from the v2 measurements and the T2 / T6 probes of `forge/terrain` (800 N/m reached the
+Until 2026-11-09 the Hard tasks also put ice patches (`ice_frac` 0.15 of 2 m cells, μ 0.05–0.15) on `slip_field` and
+`slip_slope`, and `slip_prob` was 0.02. The smoke table below and `v3_hard` (§5.4) were measured with that setting; ice
+is now the separate type `ice_field`. The first values came from the v2 measurements and the T2 / T6 probes of `forge/terrain` (800 N/m reached the
 hardpan under a 98 N static load; `disable` drops the foot to the hardpan). The GPU smoke runs (Robust, 1 min of
 20 robots per terrain, 10 trigger windows; `smoke_hard`, `smoke_hard2`, 2026-10-31) then measured:
 
@@ -139,6 +142,12 @@ after the reset. `-FaultsMild` has only a mild power loss (h ∈ [0.6, 0.85], 70
 the actuators in Isaac Lab, so the energy policy's `pd_gains` randomization (Newton actuators only) is dropped and its
 motor-strength observation reads the nominal 1 (`mdp.nominal_motor_strength`). Used by
 `results/reports/clustering/20261102_mechanism_detection` (collections `faults_v1`, `faults_mild`).
+
+### 3.8 `-Hard-Stress<N>` test tiers
+
+Robust policy only, on six maps: `...-Robust-Hard-Stress<N>` applies tier `N` of `env_cfg.STRESS` after `apply_hard`
+(knobs and values there; counts per map in `STRESS_TIERS`). They are test settings, not a campaign;
+results in `results/reports/surveillance/20261109_stress_tiers`.
 
 ## 4. Deviations
 
@@ -333,6 +342,11 @@ the proprioception does not tell how the robot will fall; v1's higher numbers (0
 
 ## 6. Changelog
 
+- 2026-11-09: `-Hard-Stress<N>` test tiers of the robust policy (§3.8). Reason: the user's request (0-6 falls on six `-Hard`
+  maps).
+- 2026-11-09: `slip_field` moved to `forge/terrain`, whose new `ice_field` gets the `foot_slip` trigger; `apply_hard` no
+  longer adds ice to the slip terrains; `slip_prob` 0.25 (§3.4, §3.5). Replaying `v3_*` slip collections through these
+  task names now builds the new physics. Reason: the user's request (event slips and ice as separate terrain types).
 - 2026-11-02: `-Faults` / `-FaultsMild` variants (§3.7), trigger `fault_or_event`, `campaign.py --faults`; GPU smoke
   (`smoke_faults`, both policies) and collections `faults_v1`, `faults_mild`. Ruff check / format clean; the
   2-iteration train check of AGENT.md not run (play-only tasks). Reason: the user's mechanism-detection request (faults as failure

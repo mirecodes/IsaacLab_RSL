@@ -88,6 +88,9 @@ class leg_flag(ManagerTermBase):
         # phantom first: a true alarm overrides it
         phantom = (self.ph_start >= 0) & (step >= self.ph_start) & (step < self.ph_end)
         flag[self.rows[phantom], self.ph_leg[phantom]] = 1.0
+        # without injectors (the Stand variant) every flag is a scheduled one
+        if not any("motor_fault" in names for names in env.event_manager.active_terms.values()):
+            return flag
 
         injector = env.event_manager.get_term_cfg("motor_fault").func
         num_j = injector.num_joints
@@ -112,6 +115,16 @@ def flagged_foot_load(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, nomina
     forces = _t(env.scene.sensors[sensor_cfg.name].data.net_forces_w)[:, sensor_cfg.body_ids]
     load = (torch.linalg.norm(forces, dim=-1) / nominal_load).clamp(max=2.0)
     return (load * get_flag(env)).sum(1)
+
+
+def flagged_foot_contact(
+    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, nominal_load: float, threshold: float = 5.0
+) -> torch.Tensor:
+    """Discrete cost of a flagged foot on the ground: ``1 + F_z / F_0`` once its vertical force ``F_z`` exceeds
+    ``threshold`` [N], else 0. ``F_z / F_0`` is capped at 2 so touchdown impulses do not dominate the return."""
+    fz = _t(env.scene.sensors[sensor_cfg.name].data.net_forces_w)[:, sensor_cfg.body_ids, 2].clamp(min=0.0)
+    cost = (fz > threshold).float() * (1.0 + (fz / nominal_load).clamp(max=2.0))
+    return (cost * get_flag(env)).sum(1)
 
 
 class GuardCPGAction(CPGJointPositionAction):
